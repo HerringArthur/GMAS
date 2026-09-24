@@ -97,7 +97,7 @@ class BaseOrchestra:
         self.agents_to_wg_mapping = agents_to_wg_mapping
 
         self.agents: Dict[str, BaseAgent] = {
-            name: AgentRegistry.create(name=name,
+            name: self.create_agent(name=name,
                                        wg_id=self.agents_to_wg_mapping[name],
                                        tokenizer=tokenizers[self.agents_to_wg_mapping[name]],
                                        processor=processors[self.agents_to_wg_mapping[name]],
@@ -109,6 +109,10 @@ class BaseOrchestra:
         self.model_ids = model_ids
         self.multiagent_batch_buffer: List[Dict] = []  # Buffer to store multiagent output batches
         self.memory = None
+
+    def create_agent(self, name: str, **kwargs) -> BaseAgent:
+        """Create an agent; orchestras may supply named instances of a shared class."""
+        return AgentRegistry.create(name=name, **kwargs)
 
     def reset(self):
         """Reset the orchestra, all agents, and buffer."""

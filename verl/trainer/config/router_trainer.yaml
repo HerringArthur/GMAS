@@ -1,0 +1,17 @@
+defaults:
+  - ppo_trainer
+  - _self_
+
+agent:
+  orchestra_type: router
+  agent_ids: ["Router Agent", "Sub Agent 1", "Sub Agent 2", "Sub Agent 3"]
+  model_ids: ["Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "Qwen/Qwen3-4B"]
+  model_sharing: false
+  use_agent_memory: false
+  orchestra:
+    router:
+      max_loop_num: 8
+
+env:
+  env_name: math
+  history_length: 2 # Search environments supply tool history through env_obs.

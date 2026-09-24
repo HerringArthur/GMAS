@@ -397,6 +397,8 @@ class MultiAgentTrajectoryCollector(TrajectoryCollector):
             from agent_system.agent.orchestra.search import SearchMultiAgentOrchestra as orchestra
         elif orchestra_type == "math":
             from agent_system.agent.orchestra.math import MathMultiAgentOrchestra as orchestra
+        elif orchestra_type == "router":
+            from agent_system.agent.orchestra.router import RouterMultiAgentOrchestra as orchestra
         else:
             raise ValueError(f"Unknown orchestra_type '{orchestra_type}'.")
 
