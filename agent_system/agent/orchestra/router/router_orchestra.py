@@ -69,6 +69,15 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.team_context = None
         self.current_agents = None
         self.submission_actions = None
+        # One path is kept for each environment item.  A path is extended only
+        # when the router chooses a worker; worker CONTINUE/HANDOFF responses do
+        # not add another node by themselves.
+        self.agent_paths = None
+        # The prefix that preceded the current worker segment.  This is needed
+        # to assign the same parent prefix to every CONTINUE response in that
+        # segment.
+        self.segment_parent_paths = None
+
     def create_agent(self, name: str, **kwargs):
         if name == self.ROUTER_AGENT:
             return RouterAgent(**kwargs)
@@ -79,6 +88,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.team_context = None
         self.current_agents = None
         self.submission_actions = None
+        self.agent_paths = None
+        self.segment_parent_paths = None
 
     def initialize_context(self, env_obs):
         """Reuse agent work from this rollout while reading fresh environment history."""
@@ -88,9 +99,51 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             self.team_context = initial_context
             self.current_agents = np.full(batch_size, '', dtype=object)
             self.submission_actions = [''] * batch_size
+            self.agent_paths = [[] for _ in range(batch_size)]
+            self.segment_parent_paths = [tuple() for _ in range(batch_size)]
         elif len(self.team_context) != batch_size:
             raise ValueError("Batch size changed; call reset() before starting a new rollout.")
+        elif len(self.agent_paths) != batch_size or len(self.segment_parent_paths) != batch_size:
+            raise ValueError("Rollout path state is inconsistent; call reset() before starting a new rollout.")
         return text_actions, self.team_context, env_obs
+
+    @staticmethod
+    def _object_array(values: List[Any]) -> np.ndarray:
+        """Create a one-dimensional object array without tuple broadcasting."""
+        result = np.empty(len(values), dtype=object)
+        for index, value in enumerate(values):
+            result[index] = value
+        return result
+
+    def _set_path_metadata(
+        self,
+        batch: DataProto,
+        paths: List[Tuple[str, ...]],
+        parent_paths: List[Tuple[str, ...]],
+        route_probabilities: List[Dict[str, float]],
+    ) -> None:
+        """Attach path metadata to every row in an agent output batch."""
+        batch.non_tensor_batch['agent_path'] = self._object_array(paths)
+        batch.non_tensor_batch['prefix_key'] = self._object_array(paths)
+        batch.non_tensor_batch['parent_prefix_key'] = self._object_array(parent_paths)
+        batch.non_tensor_batch['route_probabilities'] = self._object_array(route_probabilities)
+
+    def save_to_buffer(self, name: str, batch: DataProto):
+        # Every row must have the same metadata fields when the rollout collector
+        # collates router and worker samples into a single training batch.
+        defaults = {
+            'selected_agent': '',
+            'handoff_decision': '',
+            'agent_path': tuple(),
+            'prefix_key': tuple(),
+            'parent_prefix_key': tuple(),
+            'route_probabilities': {},
+        }
+        for key, default in defaults.items():
+            if key not in batch.non_tensor_batch:
+                values = [default.copy() if isinstance(default, dict) else default for _ in range(len(batch))]
+                batch.non_tensor_batch[key] = self._object_array(values)
+        super().save_to_buffer(name, batch)
 
     def _environment_action(self, response: str) -> Tuple[str, bool]:
         """Remove orchestration control and adapt text to the existing environment."""
@@ -140,6 +193,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             router_mask = pending_mask & (self.current_agents == '')
             if router_mask.any():
                 actor_rollout_wg = actor_rollout_wgs[self.agents_to_wg_mapping[self.ROUTER_AGENT]]
+                parent_paths = [tuple(path) for path in self.agent_paths]
                 batch, text_responses = self.agents[self.ROUTER_AGENT].call(
                     gen_batch=gen_batch,
                     env_obs=env_obs,
@@ -159,6 +213,19 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                 finished = finish_requests & can_submit & batch.non_tensor_batch['is_action_valid']
                 pending_mask[finished] = False
                 valid_routes = router_mask & np.isin(selections, self.worker_ids) & batch.non_tensor_batch['is_action_valid']
+                router_paths = [tuple(path) for path in self.agent_paths]
+                route_probabilities = [
+                    value if isinstance(value, dict) else {}
+                    for value in batch.non_tensor_batch.get(
+                        'route_probabilities', self._object_array([{} for _ in range(batch_size)])
+                    )
+                ]
+                for i in np.flatnonzero(valid_routes):
+                    child_path = parent_paths[i] + (str(selections[i]),)
+                    self.agent_paths[i] = list(child_path)
+                    self.segment_parent_paths[i] = parent_paths[i]
+                    router_paths[i] = child_path
+                self._set_path_metadata(batch, router_paths, parent_paths, route_probabilities)
                 self.current_agents[valid_routes] = selections[valid_routes]
                 self.save_to_buffer(self.ROUTER_AGENT, batch)
 
@@ -177,6 +244,17 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                     step=step,
                 )
                 team_context = update_team_context(agent_id, team_context, text_responses, agent_mask)
+                worker_paths = [tuple(path) if agent_mask[i] else tuple() for i, path in enumerate(self.agent_paths)]
+                worker_parent_paths = [
+                    self.segment_parent_paths[i] if agent_mask[i] else tuple()
+                    for i in range(batch_size)
+                ]
+                self._set_path_metadata(
+                    batch,
+                    worker_paths,
+                    worker_parent_paths,
+                    [{} for _ in range(batch_size)],
+                )
                 self.save_to_buffer(agent_id, batch)
 
                 decisions = batch.non_tensor_batch['handoff_decision']

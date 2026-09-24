@@ -278,7 +278,10 @@ def collate_fn(x: list["DataProtoItem"]):
     batch = torch.stack(batch).contiguous()
     non_tensor_batch = list_of_dict_to_dict_of_list(non_tensor_batch)
     for key, val in non_tensor_batch.items():
-        non_tensor_batch[key] = np.array(val, dtype=object)
+        values = np.empty(len(val), dtype=object)
+        for index, item in enumerate(val):
+            values[index] = item
+        non_tensor_batch[key] = values
     return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
 

@@ -60,7 +60,14 @@ def collate_fn(data_list: list[dict]) -> dict:
         tensors[key] = torch.stack(val, dim=0)
 
     for key, val in non_tensors.items():
-        non_tensors[key] = np.array(val, dtype=object)
+        # Assign one item at a time so tuple/list metadata (for example an
+        # agent path or prefix key) remains a one-dimensional object array.
+        # ``np.array(val, dtype=object)`` expands equal-length tuples into an
+        # extra dimension, which breaks DataProto's batch-axis convention.
+        values = np.empty(len(val), dtype=object)
+        for index, item in enumerate(val):
+            values[index] = item
+        non_tensors[key] = values
 
     return {**tensors, **non_tensors}
 

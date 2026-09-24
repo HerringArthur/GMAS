@@ -170,6 +170,8 @@ class RouterTests(unittest.TestCase):
         self.assertNotIn('B1', orchestra.team_context[0])
         self.assertIn('B1', self.events[-1][1][1])
         self.assertEqual(orchestra.team_context[2], '')
+        schemas = [set(entry['batch'].non_tensor_batch) for entry in buffer]
+        self.assertTrue(all(keys == schemas[0] for keys in schemas))
 
     def test_search_yields_and_continue_resumes_same_worker(self):
         orchestra = self.make_orchestra(loops=2, env_name='search')

@@ -57,6 +57,15 @@ tags, are appended to `team_context` with the emitting agent's name after each
 call. Shared context and current workers survive environment steps and are cleared
 by `reset()` at the beginning of a new rollout.
 
+Each saved response row also carries `agent_path`, `prefix_key`,
+`parent_prefix_key`, and `route_probabilities`. A worker selection extends the
+path once; CONTINUE, HANDOFF, and FINISH do not append a node. `prefix_key` is the
+tuple form of `agent_path`, while `parent_prefix_key` identifies the prefix before
+the current worker segment. Router probabilities cover every configured worker
+and FINISH and are obtained by scoring candidate route completions under the
+current policy. Backends that cannot score candidates leave an empty mapping for
+the trainer to handle explicitly.
+
 Unlike Search/Math, `initialize_context()` reuses `self.team_context` on subsequent
 calls. For example, a worker's intermediate derivation remains available after a
 search even if that derivation was not included in the search query. This memory
