@@ -120,13 +120,11 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         batch: DataProto,
         paths: List[Tuple[str, ...]],
         parent_paths: List[Tuple[str, ...]],
-        route_probabilities: List[Dict[str, float]],
     ) -> None:
         """Attach path metadata to every row in an agent output batch."""
         batch.non_tensor_batch['agent_path'] = self._object_array(paths)
         batch.non_tensor_batch['prefix_key'] = self._object_array(paths)
         batch.non_tensor_batch['parent_prefix_key'] = self._object_array(parent_paths)
-        batch.non_tensor_batch['route_probabilities'] = self._object_array(route_probabilities)
 
     def save_to_buffer(self, name: str, batch: DataProto):
         # Every row must have the same metadata fields when the rollout collector
@@ -137,11 +135,10 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             'agent_path': tuple(),
             'prefix_key': tuple(),
             'parent_prefix_key': tuple(),
-            'route_probabilities': {},
         }
         for key, default in defaults.items():
             if key not in batch.non_tensor_batch:
-                values = [default.copy() if isinstance(default, dict) else default for _ in range(len(batch))]
+                values = [default for _ in range(len(batch))]
                 batch.non_tensor_batch[key] = self._object_array(values)
         super().save_to_buffer(name, batch)
 
@@ -214,18 +211,12 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                 pending_mask[finished] = False
                 valid_routes = router_mask & np.isin(selections, self.worker_ids) & batch.non_tensor_batch['is_action_valid']
                 router_paths = [tuple(path) for path in self.agent_paths]
-                route_probabilities = [
-                    value if isinstance(value, dict) else {}
-                    for value in batch.non_tensor_batch.get(
-                        'route_probabilities', self._object_array([{} for _ in range(batch_size)])
-                    )
-                ]
                 for i in np.flatnonzero(valid_routes):
                     child_path = parent_paths[i] + (str(selections[i]),)
                     self.agent_paths[i] = list(child_path)
                     self.segment_parent_paths[i] = parent_paths[i]
                     router_paths[i] = child_path
-                self._set_path_metadata(batch, router_paths, parent_paths, route_probabilities)
+                self._set_path_metadata(batch, router_paths, parent_paths)
                 self.current_agents[valid_routes] = selections[valid_routes]
                 self.save_to_buffer(self.ROUTER_AGENT, batch)
 
@@ -253,7 +244,6 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                     batch,
                     worker_paths,
                     worker_parent_paths,
-                    [{} for _ in range(batch_size)],
                 )
                 self.save_to_buffer(agent_id, batch)
 
