@@ -29,7 +29,7 @@ from verl import DataProto
 import uuid
 
 from difflib import SequenceMatcher
-from typing import Sequence, List, Dict, Any
+from typing import Sequence, List, Dict, Any, Tuple
 
 
 class AdaptiveKLController:
@@ -86,6 +86,202 @@ def to_hashable(x):
         return tuple(sorted((k, to_hashable(v)) for k, v in x.items()))
     else:
         raise TypeError(f"Unsupported type: {type(x)}")
+
+
+def _normalize_group_scalar(value: Any) -> Any:
+    """Normalize a scalar metadata value before using it as a dictionary key."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    return to_hashable(value)
+
+
+def _normalize_prefix_key(value: Any, field_name: str) -> Tuple[Any, ...]:
+    """Normalize a serialized agent path into a hashable tuple.
+
+    Router metadata is carried through ``DataProto.non_tensor_batch`` and can be
+    represented as a tuple, list, or object-array element depending on where the
+    batch was collated.  Keeping the path as a tuple prevents list identity and
+    NumPy broadcasting from changing the grouping key.
+    """
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{field_name} must contain a list or tuple path, got {type(value)!r}.")
+    return tuple(_normalize_group_scalar(item) for item in value)
+
+
+def build_router_subagent_group_index(
+    *,
+    agent_ids: Sequence[Any],
+    uids: Sequence[Any],
+    traj_uids: Sequence[Any],
+    prefix_keys: Sequence[Any],
+    parent_prefix_keys: Sequence[Any],
+    selected_agents: Sequence[Any],
+    is_action_valid: Sequence[Any],
+    router_agent_id: str = "Router Agent",
+) -> Dict[str, Any]:
+    """Build statistical grouping and trajectory-deduplication indices.
+
+    This helper deliberately does not inspect rewards and does not remove rows
+    from the training batch.  Each deduplication unit stores all of its original
+    row indices; a later credit stage can assign one reward/credit to the unit
+    and broadcast that value back to every stored row.
+
+    SubAgent rows are grouped by ``prefix_key`` and deduplicated by
+    ``(prefix_key, traj_uid)``.  This allows the same prefix from different task
+    ``uid`` values to share a baseline while keeping different occurrences of an
+    agent on different prefixes separate.
+
+    Router rows are grouped by ``(uid, parent_prefix_key)`` and deduplicated by
+    ``(uid, parent_prefix_key, traj_uid)``.  Invalid Router rows are excluded
+    from Router statistics but their row indices are returned so the caller can
+    retain existing invalid-action handling.  The selected action is stored on
+    each deduplicated unit; it is intentionally not part of the deduplication
+    key, so one trajectory cannot count as multiple Router choices.
+
+    Args:
+        agent_ids: Agent name for each response row.
+        uids: Task/group uid for each response row.
+        traj_uids: Unique trajectory uid for each response row.
+        prefix_keys: Full worker path for each response row.
+        parent_prefix_keys: Path immediately before the Router choice/current
+            worker segment for each response row.
+        selected_agents: Parsed Router choice, including ``FINISH``. Values on
+            SubAgent rows are ignored.
+        is_action_valid: Validity flag for each response row. Only Router rows
+            with a true flag enter Router statistics.
+        router_agent_id: Name used to identify Router rows.
+
+    Returns:
+        A dictionary with the following fields:
+
+        ``subagent_groups``:
+            ``{prefix_key: {traj_uid: [row_indices]}}``.
+        ``router_groups``:
+            ``{(uid, parent_prefix_key): {traj_uid: {row_indices,
+            selected_action}}}``.
+        ``row_to_subagent_unit`` and ``row_to_router_unit``:
+            Reverse mappings used to broadcast a later credit to every original
+            response row.
+        ``invalid_router_rows``:
+            Row indices for invalid Router responses.
+    """
+    fields = {
+        "agent_ids": agent_ids,
+        "uids": uids,
+        "traj_uids": traj_uids,
+        "prefix_keys": prefix_keys,
+        "parent_prefix_keys": parent_prefix_keys,
+        "selected_agents": selected_agents,
+        "is_action_valid": is_action_valid,
+    }
+    lengths = {name: len(values) for name, values in fields.items()}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"Router/SubAgent metadata arrays must have equal lengths, got {lengths}.")
+
+    subagent_groups: Dict[Tuple[Any, ...], Dict[Any, List[int]]] = {}
+    router_groups: Dict[Tuple[Any, Tuple[Any, ...]], Dict[Any, Dict[str, Any]]] = {}
+    row_to_subagent_unit: Dict[int, Tuple[Tuple[Any, ...], Any]] = {}
+    row_to_router_unit: Dict[int, Tuple[Any, Tuple[Any, ...], Any]] = {}
+    invalid_router_rows: List[int] = []
+
+    for row_index, (agent_id, uid, traj_uid, prefix_key, parent_prefix_key, selected_agent, valid) in enumerate(
+        zip(
+            agent_ids,
+            uids,
+            traj_uids,
+            prefix_keys,
+            parent_prefix_keys,
+            selected_agents,
+            is_action_valid,
+        )
+    ):
+        normalized_agent_id = _normalize_group_scalar(agent_id)
+        normalized_uid = _normalize_group_scalar(uid)
+        normalized_traj_uid = _normalize_group_scalar(traj_uid)
+        normalized_prefix = _normalize_prefix_key(prefix_key, "prefix_key")
+        normalized_parent_prefix = _normalize_prefix_key(parent_prefix_key, "parent_prefix_key")
+
+        if normalized_agent_id != router_agent_id:
+            # The outer prefix key and inner trajectory key together implement
+            # the (traj_uid, prefix_key) statistical deduplication rule.
+            prefix_group = subagent_groups.setdefault(normalized_prefix, {})
+            prefix_group.setdefault(normalized_traj_uid, []).append(row_index)
+            row_to_subagent_unit[row_index] = (normalized_prefix, normalized_traj_uid)
+            continue
+
+        if not bool(valid):
+            invalid_router_rows.append(row_index)
+            continue
+
+        router_group_key = (normalized_uid, normalized_parent_prefix)
+        router_group = router_groups.setdefault(router_group_key, {})
+        normalized_action = _normalize_group_scalar(selected_agent)
+        unit = router_group.get(normalized_traj_uid)
+        if unit is None:
+            unit = {
+                "row_indices": [],
+                "selected_action": normalized_action,
+            }
+            router_group[normalized_traj_uid] = unit
+        elif unit["selected_action"] != normalized_action:
+            raise ValueError(
+                "A Router deduplication unit contains conflicting selected actions: "
+                f"uid={normalized_uid!r}, parent_prefix_key={normalized_parent_prefix!r}, "
+                f"traj_uid={normalized_traj_uid!r}."
+            )
+        unit["row_indices"].append(row_index)
+        row_to_router_unit[row_index] = (normalized_uid, normalized_parent_prefix, normalized_traj_uid)
+
+    return {
+        "subagent_groups": subagent_groups,
+        "router_groups": router_groups,
+        "row_to_subagent_unit": row_to_subagent_unit,
+        "row_to_router_unit": row_to_router_unit,
+        "invalid_router_rows": invalid_router_rows,
+    }
+
+
+def build_router_subagent_group_index_from_batch(
+    data: DataProto,
+    router_agent_id: str = "Router Agent",
+) -> Dict[str, Any]:
+    """Build Router/SubAgent grouping indices directly from a ``DataProto``.
+
+    This adapter is intentionally separate from reward extraction.  It is the
+    entry point that the future custom GRPO branch can call after batch padding
+    and before computing group statistics.
+    """
+    required_fields = (
+        "agent_id",
+        "uid",
+        "traj_uid",
+        "prefix_key",
+        "parent_prefix_key",
+        "selected_agent",
+        "is_action_valid",
+    )
+    missing_fields = [field for field in required_fields if field not in data.non_tensor_batch]
+    if missing_fields:
+        raise KeyError(
+            "Router/SubAgent grouping requires non-tensor metadata fields: "
+            + ", ".join(missing_fields)
+        )
+    non_tensor_batch = data.non_tensor_batch
+    return build_router_subagent_group_index(
+        agent_ids=non_tensor_batch["agent_id"],
+        uids=non_tensor_batch["uid"],
+        traj_uids=non_tensor_batch["traj_uid"],
+        prefix_keys=non_tensor_batch["prefix_key"],
+        parent_prefix_keys=non_tensor_batch["parent_prefix_key"],
+        selected_agents=non_tensor_batch["selected_agent"],
+        is_action_valid=non_tensor_batch["is_action_valid"],
+        router_agent_id=router_agent_id,
+    )
+
 
 def summarize_group_size(group_size: list):
     """
