@@ -187,13 +187,19 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     kld = kld * response_mask
     beta = kl_ctrl.value
 
-    token_level_rewards = token_level_scores - beta * kld
+    if "invalid_action_penalty" in data.batch.keys():
+        invalid_action_penalty = data.batch["invalid_action_penalty"]
+    else:
+        invalid_action_penalty = torch.zeros_like(token_level_scores)
+    kl_penalty_rewards = -beta * kld
+    token_level_rewards = token_level_scores + invalid_action_penalty + kl_penalty_rewards
 
     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    data.batch["kl_penalty"] = kl_penalty_rewards
     data.batch["token_level_rewards"] = token_level_rewards
 
     metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
@@ -202,6 +208,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
 def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=float):
     reward_tensor = data.batch['token_level_scores']
+    invalid_action_penalty = torch.zeros_like(reward_tensor)
     if 'step_rewards' in data.batch.keys():
         step_rewards = data.batch['step_rewards']
     for i in range(len(data)):
@@ -215,14 +222,14 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
 
         action_valids = data_item.non_tensor_batch['is_action_valid'].astype(np.float32)
         action_invalids = torch.tensor(1 - action_valids, dtype=torch.float32, device=prompt_ids.device).squeeze(0)
-        # invalid action penalty
-        # assert reward_tensor[i, valid_response_length - 1] != 0.0, f'i={i}'
-        reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
+        # Keep the environment reward unchanged and store the penalty separately.
+        invalid_action_penalty[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
 
         if 'step_rewards' in data.batch.keys():
             step_rewards[i] -= invalid_action_penalty_coef * action_invalids
     
     valid_action_ratio = np.mean(data.non_tensor_batch['is_action_valid'].astype(np.float32)).item()
+    data.batch["invalid_action_penalty"] = invalid_action_penalty
     metrics = {'episode/valid_action_ratio': valid_action_ratio}
     return data, metrics
 
@@ -244,7 +251,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, group_by_agent_id=False, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, **kwargs):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, group_by_agent_id=False, credit_mode="standard", step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, **kwargs):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -258,6 +265,9 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         num_repeat (int, optional): Number of times to repeat the computation. Defaults to 1.
         multi_turn (bool, optional): Whether the data is from a multi-turn conversation. Defaults to False.
         norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in GRPO. Defaults to True.
+        credit_mode (str, optional): Advantage mode for GRPO. ``standard`` uses
+            the existing GRPO grouping; ``router_subagent`` uses the empirical
+            Router/SubAgent credit tables.
 
     Returns:
         DataProto: The updated data with computed advantages and returns.
@@ -265,6 +275,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch:
         data.batch["response_mask"] = compute_response_mask(data)
+    if credit_mode == "router_subagent" and group_by_agent_id:
+        raise ValueError("credit_mode='router_subagent' cannot be combined with group_by_agent_id=True.")
     # Determine grouping strategy based on configuration
     if group_by_agent_id:
         # Group by both uid and agent_id
@@ -297,15 +309,39 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             # If multi-turn, replace the mask with the relevant part of loss_mask
             response_length = grpo_calculation_mask.size(1)  # Get length from the initial response mask
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]  # This mask is the one intended for GRPO
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=group_index,
-            traj_index=data.non_tensor_batch['traj_uid'],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-            group_by_agent_id=group_by_agent_id,
-        )
+        if credit_mode == "router_subagent":
+            group_index = core_algos.build_router_subagent_group_index_from_batch(data)
+            credit_result = core_algos.compute_router_subagent_credit(group_index)
+            normalized_credit = core_algos.normalize_router_subagent_credit(
+                group_index,
+                credit_result,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+            credit_advantages = core_algos.build_token_level_credit_advantage(
+                normalized_credit,
+                grpo_calculation_mask,
+            )
+            if "invalid_action_penalty" in data.batch.keys():
+                invalid_action_penalty = data.batch["invalid_action_penalty"]
+            else:
+                invalid_action_penalty = torch.zeros_like(credit_advantages)
+            if "kl_penalty" in data.batch.keys():
+                kl_penalty_rewards = data.batch["kl_penalty"]
+            else:
+                kl_penalty_rewards = torch.zeros_like(credit_advantages)
+            penalty_advantages = (invalid_action_penalty + kl_penalty_rewards) * grpo_calculation_mask
+            advantages = credit_advantages + penalty_advantages
+            returns = advantages
+        else:
+            # Call compute_grpo_outcome_advantage with parameters matching its definition
+            advantages, returns = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=group_index,
+                traj_index=data.non_tensor_batch['traj_uid'],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                group_by_agent_id=group_by_agent_id,
+            )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GRPO_PASSK:
@@ -1347,12 +1383,19 @@ class RayPPOTrainer:
                             batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
                             metrics.update(kl_metrics)
                         else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            batch.batch["kl_penalty"] = torch.zeros_like(batch.batch["token_level_scores"])
+                            if "invalid_action_penalty" in batch.batch.keys():
+                                batch.batch["token_level_rewards"] = (
+                                    batch.batch["token_level_scores"] + batch.batch["invalid_action_penalty"]
+                                )
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
                         group_by_agent_id = self.config.algorithm.get("group_by_agent_id", False) # 
+                        credit_mode = self.config.algorithm.get("credit_mode", "standard")
 
                         batch = compute_advantage(
                             batch,
@@ -1362,6 +1405,7 @@ class RayPPOTrainer:
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             group_by_agent_id=group_by_agent_id,
+                            credit_mode=credit_mode,
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             use_pf_ppo=self.config.algorithm.use_pf_ppo,
                             pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,

@@ -15,3 +15,8 @@ agent:
 env:
   env_name: math
   history_length: 2 # Search environments supply tool history through env_obs.
+
+algorithm:
+  adv_estimator: grpo
+  group_by_agent_id: false
+  credit_mode: router_subagent

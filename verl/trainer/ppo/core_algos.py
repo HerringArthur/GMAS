@@ -18,6 +18,7 @@ The function implemented in this file should be used by trainer with different d
 implement PPO
 """
 
+import math
 from collections import defaultdict, Counter
 
 import numpy as np
@@ -245,6 +246,224 @@ def build_router_subagent_group_index(
     }
 
 
+def attach_episode_rewards_to_group_index(
+    group_index: Dict[str, Any],
+    traj_uids: Sequence[Any],
+    episode_rewards: Sequence[Any],
+) -> Dict[str, Any]:
+    """Attach one rollout-level reward to every deduplicated unit.
+
+    ``episode_rewards`` is the cumulative environment reward produced by the
+    rollout collector.  It is copied onto every response row belonging to the
+    same trajectory, so this function first creates one value per ``traj_uid``
+    and then exposes reward lookups for the SubAgent and Router deduplication
+    units.  It does not calculate credit or modify token-level rewards.
+    """
+    if len(traj_uids) != len(episode_rewards):
+        raise ValueError(
+            "traj_uids and episode_rewards must have equal lengths, "
+            f"got {len(traj_uids)} and {len(episode_rewards)}."
+        )
+
+    trajectory_rewards: Dict[Any, Any] = {}
+    for traj_uid, reward in zip(traj_uids, episode_rewards):
+        normalized_traj_uid = _normalize_group_scalar(traj_uid)
+        if isinstance(reward, np.generic):
+            reward = reward.item()
+        trajectory_rewards.setdefault(normalized_traj_uid, reward)
+
+    subagent_unit_rewards: Dict[Tuple[Tuple[Any, ...], Any], Any] = {}
+    for prefix_key, trajectory_units in group_index["subagent_groups"].items():
+        for traj_uid in trajectory_units:
+            subagent_unit_rewards[(prefix_key, traj_uid)] = trajectory_rewards[traj_uid]
+
+    router_unit_rewards: Dict[Tuple[Any, Tuple[Any, ...], Any], Any] = {}
+    for (uid, parent_prefix_key), trajectory_units in group_index["router_groups"].items():
+        for traj_uid in trajectory_units:
+            router_unit_rewards[(uid, parent_prefix_key, traj_uid)] = trajectory_rewards[traj_uid]
+
+    return {
+        **group_index,
+        "trajectory_rewards": trajectory_rewards,
+        "subagent_unit_rewards": subagent_unit_rewards,
+        "router_unit_rewards": router_unit_rewards,
+    }
+
+
+def compute_subagent_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute prefix-group-relative credit for deduplicated SubAgent units.
+
+    The group mean is computed across unique ``traj_uid`` values in each
+    ``prefix_key`` group.  All response rows belonging to one unit receive the
+    same scalar credit; this function does not broadcast credit to tokens.
+    """
+    unit_rewards = group_index["subagent_unit_rewards"]
+    unit_credits: Dict[Tuple[Tuple[Any, ...], Any], Any] = {}
+    group_baselines: Dict[Tuple[Any, ...], Any] = {}
+    row_credits: Dict[int, Any] = {}
+
+    for prefix_key, trajectory_units in group_index["subagent_groups"].items():
+        rewards = [unit_rewards[(prefix_key, traj_uid)] for traj_uid in trajectory_units]
+        baseline = sum(rewards) / len(rewards)
+        group_baselines[prefix_key] = baseline
+        for traj_uid, row_indices in trajectory_units.items():
+            credit = unit_rewards[(prefix_key, traj_uid)] - baseline
+            unit_credits[(prefix_key, traj_uid)] = credit
+            for row_index in row_indices:
+                row_credits[row_index] = credit
+
+    return {
+        "subagent_unit_credits": unit_credits,
+        "subagent_group_baselines": group_baselines,
+        "subagent_row_credits": row_credits,
+    }
+
+
+def compute_router_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute empirical action-relative credit for deduplicated Router units.
+
+    For each ``(uid, parent_prefix_key)`` group, every trajectory contributes
+    once to the empirical action frequency and action mean reward.  The
+    baseline is the frequency-weighted action mean.  ``FINISH`` is treated as a
+    regular action because it is already stored in ``selected_action``.
+    """
+    unit_rewards = group_index["router_unit_rewards"]
+    unit_credits: Dict[Tuple[Any, Tuple[Any, ...], Any], Any] = {}
+    group_baselines: Dict[Tuple[Any, Tuple[Any, ...]], Any] = {}
+    action_statistics: Dict[Tuple[Any, Tuple[Any, ...]], Dict[Any, Dict[str, Any]]] = {}
+    row_credits: Dict[int, Any] = {}
+
+    for group_key, trajectory_units in group_index["router_groups"].items():
+        uid, parent_prefix_key = group_key
+        action_rewards: Dict[Any, List[Any]] = defaultdict(list)
+        for traj_uid, unit in trajectory_units.items():
+            action = unit["selected_action"]
+            action_rewards[action].append(unit_rewards[(uid, parent_prefix_key, traj_uid)])
+
+        total_trajectories = sum(len(rewards) for rewards in action_rewards.values())
+        action_stats: Dict[Any, Dict[str, Any]] = {}
+        baseline = 0.0
+        for action, rewards in action_rewards.items():
+            count = len(rewards)
+            probability = count / total_trajectories
+            mean_reward = sum(rewards) / count
+            action_stats[action] = {
+                "count": count,
+                "probability": probability,
+                "mean_reward": mean_reward,
+            }
+            baseline += probability * mean_reward
+
+        group_baselines[group_key] = baseline
+        action_statistics[group_key] = action_stats
+
+        for traj_uid, unit in trajectory_units.items():
+            unit_key = (uid, parent_prefix_key, traj_uid)
+            # Router credit is action-level: every trajectory choosing the
+            # same action receives S_j - baseline, rather than its own
+            # trajectory reward minus the baseline.
+            action = unit["selected_action"]
+            credit = action_stats[action]["mean_reward"] - baseline
+            unit_credits[unit_key] = credit
+            for row_index in unit["row_indices"]:
+                row_credits[row_index] = credit
+
+    return {
+        "router_unit_credits": unit_credits,
+        "router_group_baselines": group_baselines,
+        "router_action_statistics": action_statistics,
+        "router_row_credits": row_credits,
+    }
+
+
+def compute_router_subagent_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute both credit tables without mutating the training batch."""
+    return {
+        **compute_subagent_credit(group_index),
+        **compute_router_credit(group_index),
+    }
+
+
+def normalize_router_subagent_credit(
+    group_index: Dict[str, Any],
+    credit_result: Dict[str, Any],
+    norm_adv_by_std_in_grpo: bool = True,
+    epsilon: float = 1e-6,
+) -> Dict[str, Any]:
+    """Normalize SubAgent and Router credit within their own statistical groups.
+
+    SubAgent standard deviations use unique trajectory credits within each
+    ``prefix_key``. Router standard deviations use the empirical action
+    probabilities within each ``(uid, parent_prefix_key)`` group. No response
+    row duplication is used when calculating either scale.
+    """
+    subagent_unit_credits = credit_result["subagent_unit_credits"]
+    router_unit_credits = credit_result["router_unit_credits"]
+
+    subagent_unit_advantages: Dict[Tuple[Tuple[Any, ...], Any], Any] = {}
+    subagent_group_stds: Dict[Tuple[Any, ...], Any] = {}
+    subagent_row_advantages: Dict[int, Any] = {}
+    for prefix_key, trajectory_units in group_index["subagent_groups"].items():
+        credits = [subagent_unit_credits[(prefix_key, traj_uid)] for traj_uid in trajectory_units]
+        variance = sum(credit * credit for credit in credits) / len(credits)
+        std = math.sqrt(variance)
+        subagent_group_stds[prefix_key] = std
+        scale = std + epsilon if norm_adv_by_std_in_grpo else 1.0
+        for traj_uid, row_indices in trajectory_units.items():
+            unit_key = (prefix_key, traj_uid)
+            advantage = subagent_unit_credits[unit_key] / scale
+            subagent_unit_advantages[unit_key] = advantage
+            for row_index in row_indices:
+                subagent_row_advantages[row_index] = advantage
+
+    router_unit_advantages: Dict[Tuple[Any, Tuple[Any, ...], Any], Any] = {}
+    router_group_stds: Dict[Tuple[Any, Tuple[Any, ...]], Any] = {}
+    router_row_advantages: Dict[int, Any] = {}
+    for group_key, trajectory_units in group_index["router_groups"].items():
+        action_stats = credit_result["router_action_statistics"][group_key]
+        variance = sum(
+            stats["probability"] * (stats["mean_reward"] - credit_result["router_group_baselines"][group_key]) ** 2
+            for stats in action_stats.values()
+        )
+        std = math.sqrt(variance)
+        router_group_stds[group_key] = std
+        scale = std + epsilon if norm_adv_by_std_in_grpo else 1.0
+        for traj_uid, unit in trajectory_units.items():
+            unit_key = (group_key[0], group_key[1], traj_uid)
+            action = unit["selected_action"]
+            advantage = (
+                action_stats[action]["mean_reward"]
+                - credit_result["router_group_baselines"][group_key]
+            ) / scale
+            router_unit_advantages[unit_key] = advantage
+            for row_index in unit["row_indices"]:
+                router_row_advantages[row_index] = advantage
+
+    return {
+        "subagent_unit_advantages": subagent_unit_advantages,
+        "subagent_group_stds": subagent_group_stds,
+        "subagent_row_advantages": subagent_row_advantages,
+        "router_unit_advantages": router_unit_advantages,
+        "router_group_stds": router_group_stds,
+        "router_row_advantages": router_row_advantages,
+    }
+
+
+def build_token_level_credit_advantage(
+    normalized_credit: Dict[str, Any],
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Broadcast normalized row credit to the valid response tokens."""
+    token_advantages = torch.zeros_like(response_mask, dtype=torch.float32)
+    row_advantages = {
+        **normalized_credit["subagent_row_advantages"],
+        **normalized_credit["router_row_advantages"],
+    }
+    for row_index, advantage in row_advantages.items():
+        token_advantages[row_index] = advantage
+    return token_advantages * response_mask
+
+
 def build_router_subagent_group_index_from_batch(
     data: DataProto,
     router_agent_id: str = "Router Agent",
@@ -263,6 +482,7 @@ def build_router_subagent_group_index_from_batch(
         "parent_prefix_key",
         "selected_agent",
         "is_action_valid",
+        "episode_rewards",
     )
     missing_fields = [field for field in required_fields if field not in data.non_tensor_batch]
     if missing_fields:
@@ -271,7 +491,7 @@ def build_router_subagent_group_index_from_batch(
             + ", ".join(missing_fields)
         )
     non_tensor_batch = data.non_tensor_batch
-    return build_router_subagent_group_index(
+    group_index = build_router_subagent_group_index(
         agent_ids=non_tensor_batch["agent_id"],
         uids=non_tensor_batch["uid"],
         traj_uids=non_tensor_batch["traj_uid"],
@@ -280,6 +500,11 @@ def build_router_subagent_group_index_from_batch(
         selected_agents=non_tensor_batch["selected_agent"],
         is_action_valid=non_tensor_batch["is_action_valid"],
         router_agent_id=router_agent_id,
+    )
+    return attach_episode_rewards_to_group_index(
+        group_index,
+        traj_uids=non_tensor_batch["traj_uid"],
+        episode_rewards=non_tensor_batch["episode_rewards"],
     )
 
 
