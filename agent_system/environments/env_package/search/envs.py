@@ -53,6 +53,9 @@ class SearchMultiProcessEnv(gym.Env):
         # ---------- Key changes start ----------
         # 1) Normalize search_url into a list
         search_cfg  = env_config.search
+        self.retrieval_batch_size = search_cfg.get('batch_size', 0)
+        if not 0 <= self.retrieval_batch_size <= 512:
+            raise ValueError('search.batch_size must be between 0 (disabled) and 512')
         search_urls = search_cfg.search_url
         if not isinstance(search_urls, ListConfig):
             search_urls = [search_urls]
@@ -131,6 +134,9 @@ class SearchMultiProcessEnv(gym.Env):
         padded_actions = list(actions) + [""] * pad_n
         valid_mask = [True] * len(actions) + [False] * pad_n
 
+        if self.retrieval_batch_size:
+            self._prefetch_searches(padded_actions)
+
         tasks = [
             self._loop.run_in_executor(self._executor, self._sync_step, env, act)
             for env, act in zip(self.envs, padded_actions)
@@ -145,6 +151,37 @@ class SearchMultiProcessEnv(gym.Env):
         info_list = [i for i, keep in zip(info_list, valid_mask) if keep]
 
         return obs_list, reward_list, done_list, info_list
+
+    def _prefetch_searches(self, actions):
+        # One request per endpoint/chunk, instead of hundreds of concurrent
+        # requests contending for a single GPU index. Environment transitions and
+        # tool formatting still use the original step/search methods below.
+        from agent_system.environments.env_package.search.third_party.skyrl_gym.tools.search import call_search_api
+
+        groups = {}
+        for env, action in zip(self.envs, actions):
+            tool = env.tool_group
+            tool._prefetched_search = None
+            query = env.pending_search_query(action)
+            if query is not None:
+                key = (tool.search_url, tool.topk, tool.timeout)
+                groups.setdefault(key, {}).setdefault(query, []).append(tool)
+        for (url, topk, timeout), mapping in groups.items():
+            queries = list(mapping)
+            for start in range(0, len(queries), self.retrieval_batch_size):
+                chunk = queries[start:start + self.retrieval_batch_size]
+                first_tool = mapping[chunk[0]][0]
+                response, error = call_search_api(
+                    url, query='', queries=chunk, topk=topk, timeout=timeout,
+                    log_requests=first_tool.log_requests, session=first_tool.session,
+                )
+                if not error and (not isinstance(response, dict) or not isinstance(response.get('result'), list)
+                                  or len(response['result']) != len(chunk)):
+                    error = 'Batch search returned a result count that does not match the queries.'
+                for i, query in enumerate(chunk):
+                    result = {'result': [response['result'][i]]} if not error else None
+                    for tool in mapping[query]:
+                        tool._prefetched_search = (query, result, error)
 
     def close(self):
         if getattr(self, "_closed", False):

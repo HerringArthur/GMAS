@@ -23,6 +23,7 @@ from verl import DataProto
 from agent_system.agent.agents.base import BaseAgent
 from agent_system.agent.registry import AgentRegistry
 from agent_system.multi_turn_rollout.utils import preprocess_batch
+from agent_system.agent.agents.router.search_context import build_search_observation
 
 
 ROUTER_PROMPT = """
@@ -52,6 +53,32 @@ Do not output anything after </route>.
 """
 
 
+ROUTER_SEARCH_PROMPT = """
+# Your Role
+You are the router. Choose a worker to continue the task or FINISH to submit an
+existing final answer. Workers have no fixed roles; select one using the remaining
+work and shared progress. You may select the same worker again.
+
+Before choosing FINISH, check both conditions:
+- A worker has actually produced a complete <answer> </answer> block outside
+  <think>, containing a concise final answer value.
+- That candidate answers the question and is supported by sufficient evidence.
+When both hold, output <route>FINISH</route> to submit the candidate. Avoid
+additional calls or searches once the answer is ready.
+
+If either condition is unmet, select a worker. A search request, HANDOFF alone,
+or a claim of completion inside <think> is not a final answer. In particular,
+HANDOFF without an answer requires selecting a worker, not FINISH. FINISH only
+submits an existing candidate; it does not create or rewrite the answer.
+
+Your only action is routing. Output one of the complete routing strings listed
+below, using the exact agent name and <route> tags. Never output a bare agent name,
+HANDOFF, or a worker's search/answer response. Optional reasoning must appear
+before the route inside a single complete <think> </think> block. Output nothing
+after </route>.
+"""
+
+
 @AgentRegistry.register("Router Agent")
 class RouterAgent(BaseAgent):
     """Select a configured worker or FINISH independently for each active sample."""
@@ -59,14 +86,24 @@ class RouterAgent(BaseAgent):
     FINISH = "FINISH"
 
     def __init__(self, wg_id: str, tokenizer: PreTrainedTokenizer, processor, config: Any):
-        super().__init__("Router Agent", ROUTER_PROMPT, wg_id, tokenizer, processor, config)
+        prompt = ROUTER_SEARCH_PROMPT if 'search' in config.env.env_name.lower() else ROUTER_PROMPT
+        super().__init__("Router Agent", prompt, wg_id, tokenizer, processor, config)
         self.worker_ids = [name for name in config.agent.agent_ids if name != self.name]
         if not self.worker_ids or len(set(self.worker_ids)) != len(self.worker_ids):
             raise ValueError("Router Agent requires at least one worker with a unique name.")
         if self.FINISH in self.worker_ids:
             raise ValueError("FINISH is reserved for submitting the worker result.")
 
-    def build_prompt(self, env_obs: Dict[str, Any], team_context: List[str], step: int) -> Dict[str, Any]:
+    def reset(self):
+        self._search_token_cache = None
+
+    def build_prompt(self, env_obs: Dict[str, Any], team_context: List[str], step: int, agent_active_mask=None) -> Dict[str, Any]:
+        if 'search' in self.config.env.env_name.lower():
+            available_agents = "\n# Valid Routing Outputs\n" + "\n".join(
+                f"- <route>{name}</route>" for name in self.worker_ids
+            ) + "\n- <route>FINISH</route>\n\nChoose exactly one routing output."
+            return build_search_observation(self, env_obs, team_context, step, self.prompt, available_agents,
+                                            agent_active_mask=agent_active_mask)
         obs = super().build_prompt(env_obs, team_context, step)
         available_agents = "\n# Available Agents\n" + "\n".join(f"- {name}" for name in self.worker_ids)
         obs['text'] = [text + available_agents for text in obs['text']]
@@ -90,13 +127,15 @@ class RouterAgent(BaseAgent):
         step: int,
     ) -> Tuple[DataProto, List[str]]:
         """Return full router text and the selected agent in non-tensor metadata."""
-        obs = self.build_prompt(env_obs, team_context, step)
+        active_kwargs = {'agent_active_mask': agent_active_mask} if 'search' in self.config.env.env_name.lower() else {}
+        obs = self.build_prompt(env_obs, team_context, step, **active_kwargs)
         batch = preprocess_batch(
             gen_batch=gen_batch,
             obs=obs,
             config=self.config,
             tokenizer=self.tokenizer,
             processor=self.processor,
+            **active_kwargs,
         )
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
         selected_agents = [

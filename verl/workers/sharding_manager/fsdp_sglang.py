@@ -56,12 +56,19 @@ class FSDPSGLangShardingManager(BaseShardingManager):
         full_params: bool = False,
         device_mesh: DeviceMesh = None,
         offload_param: bool = False,
+        weight_sync_bucket_mb: int = 0,
+        cache_cpu_weights: bool = False,
     ):
         self.module = module
         self.inference_engine = inference_engine
         self.model_config = model_config
         self.device_mesh = device_mesh
         self.offload_param = offload_param
+        if weight_sync_bucket_mb < 0:
+            raise ValueError("weight_sync_bucket_mb must be nonnegative")
+        self.weight_sync_bucket_bytes = int(weight_sync_bucket_mb * 1024**2)
+        self.cache_cpu_weights = cache_cpu_weights
+        self._cached_cpu_weights = None
 
         # Full params
         self.full_params = full_params
@@ -92,12 +99,20 @@ class FSDPSGLangShardingManager(BaseShardingManager):
     def __enter__(self):
         torch.cuda.empty_cache()
         log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
-        if self.offload_param:
-            load_fsdp_model_to_gpu(self.module)
-        params = self.module.state_dict()
+        if self._cached_cpu_weights is not None:
+            params = self._cached_cpu_weights
+        else:
+            if self.offload_param:
+                load_fsdp_model_to_gpu(self.module)
+            params = self.module.state_dict()
+            if self.cache_cpu_weights:
+                # Independent storage: FSDP state tensors can alias live actor
+                # parameters. SGLang sleep discards its weights, so every wake
+                # still restores them, using this snapshot until invalidation.
+                params = {name: _preprocess_tensor_for_update_weights(value).detach().to("cpu", copy=True)
+                          for name, value in params.items()}
+                self._cached_cpu_weights = params
         log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
-        device = torch.cuda.current_device()  # used when fsdp2 set cpu_offload_policy
-        params = {k: v.to(device, non_blocking=True) if fsdp_version(self.module) == 2 else v for k, v in params.items()}
         # Copy, not share memory
         self.update_weights(params)
         log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
@@ -130,37 +145,46 @@ class FSDPSGLangShardingManager(BaseShardingManager):
             torch.cuda.set_rng_state(self.torch_random_states)
 
     def update_weights(self, params):
-        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+        if self.tp_rank == 0:
             self.inference_engine.resume_memory_occupation()
 
-        # Most naive implementation, can optimize a lot if it is bottleneck from sglang Engine weight update
-        named_tensors = [(k, v) for k, v in params.items()]
-        load_format = None
-        for tensor_index, (name, tensor) in enumerate(named_tensors):
-            serialized_tensor = MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor))
+        device = torch.cuda.current_device()
+        bucket, bucket_bytes = [], 0
 
-            if self.device_mesh["infer_tp"].get_local_rank() == 0:
-                gathered_serialized_tensors = [None for _ in range(self.device_mesh["infer_tp"].mesh.size()[0])]
+        def send(flush_cache):
+            # Keep GPU storage alive until the synchronous engine RPC returns.
+            serialized = [MultiprocessingSerializer.serialize(tensor) for _, tensor in bucket]
+            if self.tp_size == 1:
+                gathered = [serialized]
             else:
-                gathered_serialized_tensors = None
-            dist.gather_object(
-                obj=serialized_tensor,
-                object_gather_list=gathered_serialized_tensors,
-                dst=self.device_mesh["infer_tp"].mesh.tolist()[0],
-                group=self.device_mesh["infer_tp"].get_group(),
-            )
-
-            if self.device_mesh["infer_tp"].get_local_rank() == 0:
+                gathered = [None] * self.tp_size if self.tp_rank == 0 else None
+                dist.gather_object(serialized, gathered, dst=self.device_mesh["infer_tp"].mesh.tolist()[0],
+                                   group=self.device_mesh["infer_tp"].get_group())
+            if self.tp_rank == 0:
                 self.inference_engine.update_weights_from_tensor(
-                    named_tensors=[
-                        (
-                            name,
-                            LocalSerializedTensor(values=gathered_serialized_tensors),
-                        )
-                    ],
-                    load_format=load_format,
-                    flush_cache=tensor_index == len(named_tensors) - 1,
+                    named_tensors=[(name, LocalSerializedTensor(values=[part[i] for part in gathered]))
+                                   for i, (name, _) in enumerate(bucket)],
+                    load_format=None, flush_cache=flush_cache,
                 )
+            # TP peers must retain their IPC tensor storage until the owner has
+            # finished loading it. gather_object alone does not provide this.
+            if self.tp_size > 1:
+                dist.barrier(group=self.device_mesh["infer_tp"].get_group())
+
+        for name, value in params.items():
+            tensor = _preprocess_tensor_for_update_weights(value)
+            size = tensor.numel() * tensor.element_size()
+            if bucket and (not self.weight_sync_bucket_bytes or bucket_bytes + size > self.weight_sync_bucket_bytes):
+                send(False)
+                bucket, bucket_bytes = [], 0
+            bucket.append((name, tensor.to(device, non_blocking=True)))
+            bucket_bytes += size
+        if bucket:
+            send(True)
+
+    def invalidate_weights(self):
+        """Called before actor updates/checkpoint loads, including failed ones."""
+        self._cached_cpu_weights = None
 
     def release_memory(self):
         if self.device_mesh["infer_tp"].get_local_rank() == 0:

@@ -18,6 +18,7 @@ Single Process Actor
 """
 
 import itertools
+import inspect
 import logging
 import os
 from typing import Tuple
@@ -64,6 +65,14 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+        self.response_only_logits = self.config.get("response_only_logits", False)
+        if self.response_only_logits:
+            # Keep the forward call inside FSDP so gathering/backward hooks run.
+            model = getattr(actor_module, "_fsdp_wrapped_module", actor_module)
+            if self.use_fused_kernels or self.use_ulysses_sp:
+                raise ValueError("response_only_logits requires unfused logits and sequence parallel size 1")
+            if "logits_to_keep" not in inspect.signature(model.forward).parameters:
+                raise ValueError("response_only_logits requires a model with logits_to_keep support")
 
         self.compute_entropy_from_logits = (
             torch.compile(verl_F.entropy_from_logits, dynamic=True)
@@ -135,6 +144,17 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
 
+                output_indices = indices
+                if self.response_only_logits:
+                    # Predict each response token from its preceding position.
+                    # Keep the exact positions of the original pad/slice, including
+                    # masked slots, so both values and loss gradients are preserved.
+                    columns = indices.remainder(seqlen)
+                    keep = ((columns >= seqlen - response_length - 1) & (columns < seqlen - 1)).nonzero(as_tuple=True)[0]
+                    extra_args["logits_to_keep"] = keep
+                    output_indices = indices[keep]
+                    input_ids_rmpad_rolled = input_ids_rmpad_rolled[keep]
+
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -186,13 +206,13 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_entropy:
                     full_entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
-                        indices=indices,
+                        indices=output_indices,
                         batch=batch_size,
                         seqlen=seqlen,
                     )
                 full_log_probs = pad_input(
                     hidden_states=log_probs.unsqueeze(-1),
-                    indices=indices,
+                    indices=output_indices,
                     batch=batch_size,
                     seqlen=seqlen,
                 )
@@ -206,6 +226,10 @@ class DataParallelPPOActor(BasePPOActor):
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
+                if self.response_only_logits:
+                    extra_args["logits_to_keep"] = torch.arange(
+                        seqlen - response_length - 1, seqlen - 1, device=input_ids.device
+                    )
                 output = self.actor_module(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -223,7 +247,8 @@ class DataParallelPPOActor(BasePPOActor):
                     logits = output.logits
 
                     logits.div_(temperature)
-                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    if not self.response_only_logits:
+                        logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)

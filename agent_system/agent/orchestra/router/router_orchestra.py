@@ -147,12 +147,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         work = re.sub(r'<handoff>\s*(CONTINUE|HANDOFF)\s*</handoff>\s*$', '', response).strip()
         if not self.search_enabled:
             return work, False
-        visible_work = re.sub(r'<think>.*?</think>', '', work, flags=re.DOTALL)
-        blocks = re.findall(r'<(search|answer)>(.*?)</\1>', visible_work, flags=re.DOTALL)
-        if len(blocks) != 1 or not blocks[0][1].strip():
-            return '', False
-        tag, content = blocks[0]
-        return f'<{tag}>{content.strip()}</{tag}>', tag == 'search'
+        action, is_search, _ = SubAgent.search_action(response)
+        return action, is_search
 
     def run(
         self,

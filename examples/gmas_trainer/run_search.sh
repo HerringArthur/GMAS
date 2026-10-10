@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Usage: bash examples/gmas_trainer/run_search.sh [train|eval|evaluation] [Hydra overrides...]
+source /data/workspace/xuhaobin/miniconda3/etc/profile.d/conda.sh
+conda activate DrMAS
+
 set -euo pipefail
 set -x
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+source examples/trainer_logging.sh
+
+data_dir=/data/workspace/xuhaobin/xzy/data/MASsearch/drmas_search
 
 MODE=${1:-train}
 if [ "$#" -gt 0 ]; then
@@ -19,16 +25,16 @@ esac
 if [ "$MODE" == "eval" ] || [ "$MODE" == "evaluation" ]; then
     echo "Running in evaluation mode"
     VAL_ONLY=True
-    TRAIN_DATA="$HOME/data/drmas_search/train.parquet"
-    VAL_DATA="$HOME/data/drmas_search/test.parquet" # Full test dataset
+    TRAIN_DATA="$data_dir/train.parquet"
+    VAL_DATA="$data_dir/test.parquet" # Full test dataset
     train_data_size=128
     val_data_size=64
     val_group_size=16  # For pass@16 and avg@16 computation during evaluation
 else
     echo "Running in training mode"
     VAL_ONLY=False
-    TRAIN_DATA="$HOME/data/drmas_search/train.parquet"
-    VAL_DATA="$HOME/data/drmas_search/test_sampled.parquet" # For fast validation during training (sample 30 entries per data source, total 210 samples)
+    TRAIN_DATA="$data_dir/train.parquet"
+    VAL_DATA="$data_dir/test_sampled.parquet" # For fast validation during training (sample 30 entries per data source, total 210 samples)
     train_data_size=128
     val_data_size=256
     val_group_size=1
@@ -56,11 +62,11 @@ max_loop_num=8 # Internal Router/worker loops per environment step.
 actor_optim_lr='[1e-6,1e-6,1e-6,1e-6]'
 actor_ppo_micro_batch_size_per_gpu='[4,4,4,4]'
 
-model_name_tag=$(jq -r '.[]' <<< "$model_ids"  | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]' | tr '-' '_' | paste -sd_ -)
+model_name_tag=$(python -c 'import json, sys; print("_".join(model.rsplit("/", 1)[-1].lower().replace("-", "_") for model in json.loads(sys.argv[1])))' "$model_ids")
 
 experiment_name="gmas_share${model_sharing}_${model_name_tag}"
 
-python3 -m verl.trainer.main_ppo --config-name router_trainer \
+run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name router_trainer \
     algorithm.adv_estimator=$algorithm \
     data.train_files="$TRAIN_DATA" \
     data.val_files="$VAL_DATA" \
@@ -75,6 +81,7 @@ python3 -m verl.trainer.main_ppo --config-name router_trainer \
     actor_rollout_ref.actor.optim.lr=null \
     +agent.agent_specific_parameters.actor.optim.lr=$actor_optim_lr \
     actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.response_only_logits=True \
     actor_rollout_ref.actor.use_adaptive_ppo_mini_batch_size=True \
     actor_rollout_ref.actor.ppo_mini_update_num=5 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=null \
@@ -91,6 +98,8 @@ python3 -m verl.trainer.main_ppo --config-name router_trainer \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
+    actor_rollout_ref.rollout.weight_sync_bucket_mb=128 \
+    actor_rollout_ref.rollout.cache_cpu_weights=True \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
@@ -102,7 +111,8 @@ python3 -m verl.trainer.main_ppo --config-name router_trainer \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     env.env_name=search \
     env.seed=0 \
-    env.search.search_url='http://127.0.0.1:8000/retrieve' \
+    env.search.search_url='http://127.0.0.1:8001/retrieve' \
+    env.search.batch_size=64 \
     env.max_steps=$max_turn \
     env.rollout.n=$group_size \
     env.rollout.val_n=$val_group_size \

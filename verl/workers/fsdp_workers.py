@@ -488,6 +488,8 @@ class ActorRolloutRefWorker(Worker):
                 full_params="hf" in self.config.rollout.load_format,
                 device_mesh=rollout_device_mesh,
                 offload_param=self._is_offload_param,
+                weight_sync_bucket_mb=self.config.rollout.get("weight_sync_bucket_mb", 0),
+                cache_cpu_weights=self.config.rollout.get("cache_cpu_weights", False),
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
@@ -593,6 +595,8 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        if hasattr(getattr(self, "rollout_sharding_manager", None), "invalidate_weights"):
+            self.rollout_sharding_manager.invalidate_weights()
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 
@@ -786,6 +790,8 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        if hasattr(getattr(self, "rollout_sharding_manager", None), "invalidate_weights"):
+            self.rollout_sharding_manager.invalidate_weights()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 

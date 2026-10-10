@@ -2,6 +2,7 @@ import json
 import warnings
 from typing import List, Optional
 import argparse
+import threading
 
 import faiss
 import torch
@@ -11,7 +12,7 @@ import datasets
 
 import uvicorn
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 def load_corpus(corpus_path: str):
@@ -192,15 +193,42 @@ class BM25Retriever(BaseRetriever):
             return results
 
 
+def index_to_gpu(cpu_index, batch_size: int):
+    """Copy a single-GPU Flat index in batches to bound FP16 conversion memory."""
+    if batch_size <= 0:
+        raise ValueError("faiss_gpu_batch_size must be positive")
+
+    co = faiss.GpuMultipleClonerOptions()
+    co.useFloat16 = True
+    co.shard = True
+    # Preserve the existing cloning behavior for other index types and GPU sharding.
+    if not isinstance(cpu_index, faiss.IndexFlat) or faiss.get_num_gpus() != 1:
+        return faiss.index_cpu_to_all_gpus(cpu_index, co=co)
+
+    # Cloning the populated index converts all vectors at once. Clone an empty
+    # index instead, then add in original order so IDs still match corpus rows.
+    empty_index = faiss.IndexFlat(cpu_index.d, cpu_index.metric_type)
+    empty_index.metric_arg = cpu_index.metric_arg
+    gpu_index = faiss.index_cpu_to_all_gpus(empty_index, co=co)
+    print(
+        f"Loading {cpu_index.ntotal:,} FAISS vectors onto GPU 0 (CUDA_VISIBLE_DEVICES) "
+        f"in batches of {batch_size:,}, using FP16",
+        flush=True,
+    )
+    for batch, start in enumerate(range(0, cpu_index.ntotal, batch_size)):
+        count = min(batch_size, cpu_index.ntotal - start)
+        gpu_index.add(cpu_index.reconstruct_n(start, count))
+        if batch % 16 == 0 or start + count == cpu_index.ntotal:
+            print(f"FAISS vectors loaded: {start + count:,}/{cpu_index.ntotal:,}", flush=True)
+    return gpu_index
+
+
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
-            co = faiss.GpuMultipleClonerOptions()
-            co.useFloat16 = True
-            co.shard = True
-            self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+            self.index = index_to_gpu(self.index, config.faiss_gpu_batch_size)
 
         self.corpus = load_corpus(self.corpus_path)
         self.encoder = Encoder(
@@ -286,6 +314,7 @@ class Config:
         retrieval_query_max_length: int = 256,
         retrieval_use_fp16: bool = False,
         retrieval_batch_size: int = 128,
+        faiss_gpu_batch_size: int = 65536,
     ):
         self.retrieval_method = retrieval_method
         self.retrieval_topk = retrieval_topk
@@ -299,6 +328,7 @@ class Config:
         self.retrieval_query_max_length = retrieval_query_max_length
         self.retrieval_use_fp16 = retrieval_use_fp16
         self.retrieval_batch_size = retrieval_batch_size
+        self.faiss_gpu_batch_size = faiss_gpu_batch_size
 
 
 class QueryRequest(BaseModel):
@@ -307,7 +337,33 @@ class QueryRequest(BaseModel):
     return_scores: bool = False
 
 
+class BatchQueryRequest(BaseModel):
+    queries: List[str] = Field(..., min_length=1, max_length=512)
+    topk: Optional[int] = Field(default=None, ge=1)
+    return_scores: bool = False
+
+
 app = FastAPI()
+# FastAPI runs synchronous handlers in a thread pool. FAISS GPU resources use
+# shared temporary memory and cannot serve overlapping searches safely.
+retrieval_lock = threading.Lock()
+
+
+@app.post("/retrieve_batch")
+def retrieve_batch_endpoint(request: BatchQueryRequest):
+    """Deduplicate exact queries, search in batches, restore request order."""
+    queries = list(dict.fromkeys(request.queries))
+    with retrieval_lock:
+        output = retriever.batch_search(queries, num=request.topk or config.retrieval_topk,
+                                        return_score=request.return_scores)
+    if request.return_scores:
+        results, scores = output
+        results = [[{"document": doc, "score": float(score)} for doc, score in zip(docs, row_scores)]
+                   for docs, row_scores in zip(results, scores)]
+    else:
+        results = output
+    lookup = dict(zip(queries, results))
+    return {"result": [lookup[query] for query in request.queries]}
 
 
 @app.post("/retrieve")
@@ -324,12 +380,13 @@ def retrieve_endpoint(request: QueryRequest):
     if not request.topk:
         request.topk = config.retrieval_topk  # fallback to default
 
-    # Perform retrieval
-    if request.return_scores:
-        results, scores = retriever.search(query=request.query, num=request.topk, return_score=True)
-    else:
-        results = retriever.search(query=request.query, num=request.topk, return_score=False)
-        scores = None
+    # Serialize access to the shared encoder and GPU index.
+    with retrieval_lock:
+        if request.return_scores:
+            results, scores = retriever.search(query=request.query, num=request.topk, return_score=True)
+        else:
+            results = retriever.search(query=request.query, num=request.topk, return_score=False)
+            scores = None
 
     # Format response
     resp = []
@@ -363,9 +420,18 @@ if __name__ == "__main__":
         "--retriever_model", type=str, default="intfloat/e5-base-v2", help="Path of the retriever model."
     )
     parser.add_argument("--faiss_gpu", action="store_true", help="Use GPU for computation")
+    parser.add_argument(
+        "--faiss_gpu_batch_size", type=int, default=65536,
+        help="Vectors per batch when loading a Flat index onto a single GPU (default: 65536).",
+    )
     parser.add_argument("--port", type=int, default=8000, help="Port to run the FastAPI server on.")
+    parser.add_argument("--retrieval_batch_size", type=int, default=64, help="Queries per encoder/FAISS batch.")
 
     args = parser.parse_args()
+    if args.faiss_gpu_batch_size <= 0:
+        parser.error("--faiss_gpu_batch_size must be positive")
+    if args.retrieval_batch_size <= 0:
+        parser.error("--retrieval_batch_size must be positive")
 
     # 1) Build a config (could also parse from arguments).
     #    In real usage, you'd parse your CLI arguments or environment variables.
@@ -375,11 +441,12 @@ if __name__ == "__main__":
         corpus_path=args.corpus_path,
         retrieval_topk=args.topk,
         faiss_gpu=args.faiss_gpu,
+        faiss_gpu_batch_size=args.faiss_gpu_batch_size,
         retrieval_model_path=args.retriever_model,
         retrieval_pooling_method="mean",
         retrieval_query_max_length=256,
         retrieval_use_fp16=True,
-        retrieval_batch_size=512,  # this is unused in the current retrieval implementation, which only supports single query
+        retrieval_batch_size=args.retrieval_batch_size,
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.

@@ -38,6 +38,16 @@ class SearchEnv(BaseTextEnv):
         self.chat_history: ConversationType = []
         self.done = False
         self.turns = 0
+        self.tool_group._prefetched_search = None
+
+    def pending_search_query(self, action: str):
+        """Inspect the next action without advancing history, rewards or turns."""
+        if self.done or self.turns + 1 >= self.max_turns:
+            return None
+        if "<answer>" in action and "</answer>" in action:
+            return None
+        query = self._parse_action(action)[0]
+        return query.strip() if query is not None else None
 
 
     def _parse_action(self, action: str) -> List[Optional[str]]:

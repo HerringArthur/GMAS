@@ -21,6 +21,7 @@ import math
 from omegaconf import ListConfig
 from PIL import Image
 from verl import DataProto
+from verl.protocol import restore_dataproto_via_active_mask
 from verl.models.transformers.qwen2_vl import get_rope_index
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
@@ -216,6 +217,7 @@ def preprocess_batch(
     config,
     tokenizer,
     processor=None,
+    agent_active_mask=None,
 ) -> DataProto:
     """
     Process a batch of observation samples, converting environment observations into model-processable format.
@@ -226,6 +228,10 @@ def preprocess_batch(
             - 'text' (None or List[str]): Text observation data
             - 'image' (np.ndarray or torch.Tensor): Image observation data
             - 'anchor' (None or Any): Anchor observation without any histories or additional info. (for GiGPO only).
+        agent_active_mask: Optional per-row mask. Only active rows are processed;
+            inactive rows receive fillers to preserve the orchestra's batch shape.
+            Callers must keep using the mask to exclude fillers from generation
+            and training. At least one row must be active.
     
     Returns:
         DataProto: Contains processed batch data with preserved metadata
@@ -233,8 +239,17 @@ def preprocess_batch(
     batch_size = len(gen_batch.batch['input_ids'])
     processed_samples = []
     
-    # Process each sample in parallel
-    for item in range(batch_size):
+    indices = range(batch_size)
+    if agent_active_mask is not None:
+        agent_active_mask = np.asarray(agent_active_mask, dtype=bool)
+        if agent_active_mask.shape != (batch_size,):
+            raise ValueError('agent_active_mask must have one entry per batch item.')
+        indices = np.flatnonzero(agent_active_mask)
+        if not len(indices):
+            raise ValueError('preprocess_batch requires at least one active sample.')
+
+    # Keep original indices for per-sample metadata, but tokenize active rows only.
+    for item in indices:
         # Extract per-sample observations
         processed = preprocess_fn(
             item=item,
@@ -254,6 +269,11 @@ def preprocess_batch(
         data=batch,
         meta_info=gen_batch.meta_info
     )
+
+    if agent_active_mask is not None and not agent_active_mask.all():
+        # Inactive filler rows are excluded from generation and training by the
+        # original mask. Restore the full shape for the orchestra's row indexing.
+        new_batch = restore_dataproto_via_active_mask(new_batch, agent_active_mask)
 
     return new_batch
 
@@ -454,4 +474,3 @@ def filter_group_data(batch_list : List[Dict],
     tool_callings = tool_callings[keep_indices]
 
     return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
-

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Usage: bash examples/gmas_trainer/run_math.sh [train|eval|evaluation] [Hydra overrides...]
+source /data/workspace/xuhaobin/miniconda3/etc/profile.d/conda.sh
+conda activate DrMAS
+
 set -euo pipefail
 set -x
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+source examples/trainer_logging.sh
 
 MODE=${1:-train}
 if [ "$#" -gt 0 ]; then
@@ -55,11 +59,11 @@ max_loop_num=8 # Internal Router/worker loops per environment step.
 actor_optim_lr='[1e-6,1e-6,1e-6,1e-6]'
 actor_ppo_micro_batch_size_per_gpu='[4,4,4,4]'
 
-model_name_tag=$(jq -r '.[]' <<< "$model_ids"  | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]' | tr '-' '_' | paste -sd_ -)
+model_name_tag=$(python -c 'import json, sys; print("_".join(model.rsplit("/", 1)[-1].lower().replace("-", "_") for model in json.loads(sys.argv[1])))' "$model_ids")
 
 experiment_name="gmas_share${model_sharing}_${model_name_tag}"
 
-python3 -m verl.trainer.main_ppo --config-name router_trainer \
+run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name router_trainer \
     algorithm.adv_estimator=$algorithm \
     data.train_files="$TRAIN_DATA" \
     data.val_files="$VAL_DATA" \

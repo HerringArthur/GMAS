@@ -58,13 +58,16 @@ call. Shared context and current workers survive environment steps and are clear
 by `reset()` at the beginning of a new rollout.
 
 Each saved response row also carries `agent_path`, `prefix_key`,
-`parent_prefix_key`, and `route_probabilities`. A worker selection extends the
+and `parent_prefix_key`. A worker selection extends the
 path once; CONTINUE, HANDOFF, and FINISH do not append a node. `prefix_key` is the
 tuple form of `agent_path`, while `parent_prefix_key` identifies the prefix before
-the current worker segment. Router probabilities cover every configured worker
-and FINISH and are obtained by scoring candidate route completions under the
-current policy. Backends that cannot score candidates leave an empty mapping for
-the trainer to handle explicitly.
+the current worker segment. The Router generates and records its selection without
+scoring alternative completions or writing `route_probabilities` to the batch.
+The planned trainer computes route frequencies from valid Router selections in
+each `(uid, parent_prefix_key)` group after deduplicating trajectories. Valid FINISH
+selections count as a candidate alongside workers. Unobserved candidates are
+excluded; a group with only one observed candidate has zero Router credit.
+Credit computation is not yet implemented.
 
 Unlike Search/Math, `initialize_context()` reuses `self.team_context` on subsequent
 calls. For example, a worker's intermediate derivation remains available after a
@@ -90,10 +93,42 @@ FINISH. Only the extracted search/answer block is sent to the search environment
 the complete response stays in shared context. Math environments receive worker
 text with the trailing handoff tag removed.
 
+Search tasks use dedicated worker and router prompts in both training and
+evaluation. Workers are instructed to assess the evidence, emit one search or
+answer block outside their reasoning, and put only the concise final value inside
+an answer block. Once an answer is ready, the worker should HANDOFF so the router
+can review it. The router sees complete routing options and is instructed to
+FINISH only when an actual answer block is present and supported by the evidence.
+These are generation instructions; the control parser and loop behavior described
+above still determine how generated responses execute.
+
+The Search prompt builder keeps the original question, a bounded view of recent
+distinct agent work and the most recent proposed answer, then the retrieved
+evidence and current instructions. It decodes the retriever's JSON result wrapper
+into readable text and shares the evidence budget across retained search steps.
+It reserves 256 tokens of `data.max_prompt_length` for chat formatting and the
+system message; the unabridged responses remain in `team_context` and rollout
+buffers. Very long questions/rules that cannot fit produce an explicit error.
+
+Both agents see the remaining environment budget. For `env.max_steps=4`, only
+steps 1–3 can execute searches: SearchEnv terminates before executing a search on
+step 4. On the last step, the current worker receives a dedicated final-answer
+prompt and is asked to return its best-supported short answer with HANDOFF. The
+router still decides FINISH; the prompt does not fabricate an answer or force a
+control transition when the model ignores it.
+
+Search worker validity requires both a legal handoff and exactly one nonempty,
+complete search/answer action outside reasoning. Missing, multiple, nested, or
+incomplete actions are marked invalid and receive specific correction feedback
+on that worker's next call. Feedback is separate for every sample, cleared after
+a valid response, and reset between rollouts. Invalid outputs remain in the
+training buffer with `is_action_valid=False`, including when the control tag was
+legal. Retries use the existing internal loop budget.
+
 `max_loop_num` bounds each `run()` call: each sample receives at most one worker
 generation per loop, plus a router generation when routing is needed. If this
 limit is reached before FINISH, the latest available result is returned as a
-fallback. Invalid routes retry the router; invalid worker control tags retry the
+fallback. Invalid routes retry the router; invalid worker controls/actions retry the
 same worker. Both consume the loop budget. If no usable result is produced, the
 action is an empty string, which the environment handles as an invalid submission.
 Environment `dones`, not the routing metadata, remain the rollout loop's source of

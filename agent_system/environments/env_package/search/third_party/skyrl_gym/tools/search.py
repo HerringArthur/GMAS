@@ -5,7 +5,7 @@ import uuid
 import time
 import threading
 from typing import Tuple, Optional, Any, Dict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from agent_system.environments.env_package.search.third_party.skyrl_gym.tools.core import tool, ToolGroup
 
@@ -25,6 +25,7 @@ def call_search_api(
     timeout: int = DEFAULT_TIMEOUT,
     log_requests: bool = True,
     session: Optional[requests.Session] = None,
+    queries: Optional[list[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Calls the search API with a single query.
@@ -46,6 +47,10 @@ def call_search_api(
     log_prefix = f"[Search Request ID: {request_id}] "
 
     payload = {"query": query, "topk": topk, "return_scores": return_scores}
+    if queries is not None:
+        url = urlsplit(retrieval_service_url)
+        retrieval_service_url = urlunsplit(url._replace(path=url.path.rstrip('/') + '_batch'))
+        payload = {"queries": queries, "topk": topk, "return_scores": return_scores}
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
     # Use provided session or create a new one for this request
@@ -166,6 +171,7 @@ class SearchToolGroup(ToolGroup):
         self.topk = topk
         self.timeout = timeout
         self.log_requests = log_requests
+        self._prefetched_search = None
 
         # Extract base URL for session sharing
         parsed_url = urlparse(self.search_url)
@@ -187,14 +193,15 @@ class SearchToolGroup(ToolGroup):
         query = query.strip()
 
         try:
-            api_response, error_msg = call_search_api(
-                retrieval_service_url=self.search_url,
-                query=query,
-                topk=self.topk,
-                timeout=self.timeout,
-                log_requests=self.log_requests,
-                session=self.session,  # Pass our shared session for connection reuse
-            )
+            prefetched = self._prefetched_search
+            self._prefetched_search = None
+            if prefetched is not None and prefetched[0] == query:
+                _, api_response, error_msg = prefetched
+            else:
+                api_response, error_msg = call_search_api(
+                    retrieval_service_url=self.search_url, query=query, topk=self.topk,
+                    timeout=self.timeout, log_requests=self.log_requests, session=self.session,
+                )
         except Exception as e:
             error_msg = f"API Request Exception during batch search: {e}"
             logger.error(f"Batch search: {error_msg}")
