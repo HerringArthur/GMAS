@@ -24,58 +24,55 @@ from agent_system.agent.agents.base import BaseAgent
 from agent_system.agent.registry import AgentRegistry
 from agent_system.multi_turn_rollout.utils import preprocess_batch
 from agent_system.agent.agents.router.search_context import build_search_observation
+from agent_system.agent.agents.router.context import build_context_observation, ensure_prompt_fits
 
 
-ROUTER_PROMPT = """
-# Task Introduction
-{env_prompt}
-
-# Shared Progress at Step {step}
-{team_context}
-
+ROUTER_TASK_PROMPT = """
 # Your Role
-Select exactly one agent from the available agents listed below to perform the
-next part of the work. These agents have no fixed roles. Use their previous work
-and the remaining work to decide who should act next. You may select the same
-agent again if appropriate.
+You are the router. Review the original task and shared work, then select a worker
+or FINISH. Workers have no fixed roles. You may select the same worker again.
 
-When the task is complete and a worker has already produced a result suitable for
-submission, output <route>FINISH</route> to submit that worker result. FINISH does
-not generate a new answer. A search request is not a final result. If more work
-is needed, choose a worker instead. A worker's HANDOFF alone does not imply that
-the task is complete.
+Decide using the current progress:
+- If only intermediate work exists, identify what remains and select a worker.
+- If a candidate answer needs correction, identify its specific defect and the
+  work needed to correct it, then select a worker.
+- If a complete candidate answers the original task and is supported by the
+  reasoning or available evidence, output <route>FINISH</route>. Avoid further
+  worker calls or searches once the answer is ready.
 
-You only choose a worker or FINISH; do not solve the problem or issue tool requests.
-You may reason within <think> </think> tags, then output
-<route>exact agent name</route> or <route>FINISH</route>.
-Use an available name exactly as written.
-Do not output anything after </route>.
+When selecting a worker, describe the next task or correction in a brief
+<think> </think> block before the route so the worker can act on it. If previous
+calls have not resolved the issue, use that history to make the next task specific.
+Reselecting a worker is allowed; a repeated answer alone does not require a switch.
+
+HANDOFF and intermediate work do not imply completion. FINISH submits an existing
+candidate; it does not create or rewrite an answer. Do not produce the answer or
+issue a tool request yourself.
+
+Output exactly one <route>exact agent name</route> or <route>FINISH</route>.
+Use an available name exactly as written. Any reasoning or task instruction must
+appear before the route inside a single complete <think> </think> block. Output
+nothing after </route>.
 """
 
 
-ROUTER_SEARCH_PROMPT = """
-# Your Role
-You are the router. Choose a worker to continue the task or FINISH to submit an
-existing final answer. Workers have no fixed roles; select one using the remaining
-work and shared progress. You may select the same worker again.
+ROUTER_PROMPT = ROUTER_TASK_PROMPT
 
-Before choosing FINISH, check both conditions:
-- A worker has actually produced a complete <answer> </answer> block outside
-  <think>, containing a concise final answer value.
-- That candidate answers the question and is supported by sufficient evidence.
-When both hold, output <route>FINISH</route> to submit the candidate. Avoid
-additional calls or searches once the answer is ready.
 
-If either condition is unmet, select a worker. A search request, HANDOFF alone,
-or a claim of completion inside <think> is not a final answer. In particular,
-HANDOFF without an answer requires selecting a worker, not FINISH. FINISH only
-submits an existing candidate; it does not create or rewrite the answer.
+ROUTER_MATH_PROMPT = ROUTER_PROMPT + r"""
+# Candidate Format
+A Math candidate must contain a complete, nonempty \boxed{...} outside <think>.
+Intermediate derivations are shared work, not candidate answers. Check that the
+candidate answers the original problem and is supported by the derivation.
+"""
 
-Your only action is routing. Output one of the complete routing strings listed
-below, using the exact agent name and <route> tags. Never output a bare agent name,
-HANDOFF, or a worker's search/answer response. Optional reasoning must appear
-before the route inside a single complete <think> </think> block. Output nothing
-after </route>.
+
+ROUTER_SEARCH_PROMPT = ROUTER_TASK_PROMPT + """
+# Candidate Format
+A Search candidate must contain a complete, nonempty <answer> </answer> block
+outside <think>. Check that it answers the original question and is supported by
+sufficient evidence. A search request or a claim of completion inside <think> is
+not a candidate answer. If no candidate exists, select a worker to produce one.
 """
 
 
@@ -84,10 +81,22 @@ class RouterAgent(BaseAgent):
     """Select a configured worker or FINISH independently for each active sample."""
 
     FINISH = "FINISH"
+    RESPONSE_PATTERN = re.compile(
+        r"\s*(?:<think>((?:(?!</?think>).)*)</think>\s*)?<route>([^<>]+)</route>\s*",
+        flags=re.DOTALL,
+    )
 
     def __init__(self, wg_id: str, tokenizer: PreTrainedTokenizer, processor, config: Any):
-        prompt = ROUTER_SEARCH_PROMPT if 'search' in config.env.env_name.lower() else ROUTER_PROMPT
+        env_name = config.env.env_name.lower()
+        if 'search' in env_name:
+            prompt = ROUTER_SEARCH_PROMPT
+        elif 'math' in env_name:
+            prompt = ROUTER_MATH_PROMPT
+        else:
+            prompt = ROUTER_PROMPT
         super().__init__("Router Agent", prompt, wg_id, tokenizer, processor, config)
+        # The bounded Search builder reads this field; Math uses it below too.
+        self.search_feedback = None
         self.worker_ids = [name for name in config.agent.agent_ids if name != self.name]
         if not self.worker_ids or len(set(self.worker_ids)) != len(self.worker_ids):
             raise ValueError("Router Agent requires at least one worker with a unique name.")
@@ -95,27 +104,36 @@ class RouterAgent(BaseAgent):
             raise ValueError("FINISH is reserved for submitting the worker result.")
 
     def reset(self):
-        self._search_token_cache = None
+        self.search_feedback = None
+        self._context_token_cache = None
 
-    def build_prompt(self, env_obs: Dict[str, Any], team_context: List[str], step: int, agent_active_mask=None) -> Dict[str, Any]:
+    def build_prompt(self, env_obs: Dict[str, Any], team_context: List[str], step: int,
+                     agent_active_mask=None, collaboration_context=None) -> Dict[str, Any]:
         if 'search' in self.config.env.env_name.lower():
             available_agents = "\n# Valid Routing Outputs\n" + "\n".join(
                 f"- <route>{name}</route>" for name in self.worker_ids
             ) + "\n- <route>FINISH</route>\n\nChoose exactly one routing output."
             return build_search_observation(self, env_obs, team_context, step, self.prompt, available_agents,
-                                            agent_active_mask=agent_active_mask)
-        obs = super().build_prompt(env_obs, team_context, step)
+                                            agent_active_mask=agent_active_mask,
+                                            collaboration_context=collaboration_context)
         available_agents = "\n# Available Agents\n" + "\n".join(f"- {name}" for name in self.worker_ids)
-        obs['text'] = [text + available_agents for text in obs['text']]
-        return obs
+        return build_context_observation(self, env_obs, team_context, step, self.prompt, available_agents,
+                                         agent_active_mask=agent_active_mask,
+                                         collaboration_context=collaboration_context)
 
     def parse_response(self, response: str) -> str:
         """Return an allowed worker name, FINISH, or an empty string for invalid text."""
-        match = re.fullmatch(r"\s*(?:<think>.*?</think>\s*)?<route>([^<>]+)</route>\s*", response, flags=re.DOTALL)
+        match = self.RESPONSE_PATTERN.fullmatch(response)
         if match is None:
             return ""
-        selected_agent = match.group(1).strip()
+        selected_agent = match.group(2).strip()
         return selected_agent if selected_agent in self.worker_ids or selected_agent == self.FINISH else ""
+
+    def routing_instruction(self, response: str) -> str:
+        """Keep the instruction verbatim for a valid worker selection, if present."""
+        if self.parse_response(response) not in self.worker_ids:
+            return ''
+        return (self.RESPONSE_PATTERN.fullmatch(response).group(1) or '').strip()
 
     def call(
         self,
@@ -125,10 +143,12 @@ class RouterAgent(BaseAgent):
         actor_rollout_wg,
         agent_active_mask,
         step: int,
+        collaboration_context=None,
     ) -> Tuple[DataProto, List[str]]:
         """Return full router text and the selected agent in non-tensor metadata."""
-        active_kwargs = {'agent_active_mask': agent_active_mask} if 'search' in self.config.env.env_name.lower() else {}
-        obs = self.build_prompt(env_obs, team_context, step, **active_kwargs)
+        active_kwargs = {'agent_active_mask': agent_active_mask}
+        obs = self.build_prompt(env_obs, team_context, step, collaboration_context=collaboration_context, **active_kwargs)
+        ensure_prompt_fits(self, gen_batch, obs, agent_active_mask)
         batch = preprocess_batch(
             gen_batch=gen_batch,
             obs=obs,
@@ -142,7 +162,23 @@ class RouterAgent(BaseAgent):
             self.parse_response(response) if active else ""
             for response, active in zip(text_responses, agent_active_mask)
         ]
+        if self.search_feedback is None or len(self.search_feedback) != len(text_responses):
+            self.search_feedback = [''] * len(text_responses)
+        for i, active in enumerate(agent_active_mask):
+            if active:
+                self.search_feedback[i] = '' if selected_agents[i] else (
+                    'Output one complete <route>configured worker name</route> or '
+                    '<route>FINISH</route>, optionally preceded by one complete <think> block. '
+                    'Use a worker name from the available list and output nothing after </route>.'
+                )
         batch.non_tensor_batch['selected_agent'] = np.array(selected_agents, dtype=object)
+        batch.non_tensor_batch['routing_instruction'] = np.array([
+            self.routing_instruction(response) if active else ''
+            for response, active in zip(text_responses, agent_active_mask)
+        ], dtype=object)
+        batch.non_tensor_batch['router_feedback'] = np.array([
+            feedback if active else '' for feedback, active in zip(self.search_feedback, agent_active_mask)
+        ], dtype=object)
         batch.non_tensor_batch['is_action_valid'] = np.array([bool(name) for name in selected_agents], dtype=bool)
         batch.non_tensor_batch['env_step'] = np.array([step] * len(text_responses), dtype=object)
         return batch, text_responses
