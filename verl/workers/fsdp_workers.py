@@ -137,6 +137,14 @@ class ActorRolloutRefWorker(Worker):
         self._is_rollout = role_prefix in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = role_prefix in ["ref", "actor_rollout_ref"]
 
+        # A multi-turn rollout can invoke the same policy several times.  Keep
+        # the inference engine resident for that whole rollout so that SGLang
+        # does not have to release its memory and synchronize weights on every
+        # generation request.  The scope is enabled lazily by begin_rollout()
+        # and the sharding manager is entered on the first actual generation.
+        self._rollout_resident = False
+        self._rollout_active = False
+
         self._is_offload_param = False
         self._is_offload_optimizer = False
         if self._is_actor:
@@ -593,6 +601,32 @@ class ActorRolloutRefWorker(Worker):
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def begin_rollout(self):
+        """Enable lazy inference-engine residency for one rollout scope.
+
+        The sharding manager is deliberately not entered here.  Router-based
+        rollouts may never select this worker group, so synchronizing its
+        weights eagerly would waste time and GPU memory.  The first
+        generate_sequences call in the scope performs the synchronization.
+        """
+        if not self._is_rollout:
+            return
+        self._rollout_resident = True
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def end_rollout(self):
+        """Release inference memory at the end of one rollout scope."""
+        if not self._is_rollout:
+            return
+
+        try:
+            if self._rollout_active:
+                self.rollout_sharding_manager.__exit__(None, None, None)
+        finally:
+            self._rollout_active = False
+            self._rollout_resident = False
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         if hasattr(getattr(self, "rollout_sharding_manager", None), "invalidate_weights"):
@@ -655,7 +689,14 @@ class ActorRolloutRefWorker(Worker):
             "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        with self.rollout_sharding_manager:
+        # In a rollout residency scope, enter the sharding manager only once
+        # and keep SGLang's weights/KV allocation alive across generations.
+        # Outside that scope retain the original per-call behavior.
+        if self._rollout_resident:
+            if not self._rollout_active:
+                self.rollout_sharding_manager.__enter__()
+                self._rollout_active = True
+
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
@@ -665,10 +706,22 @@ class ActorRolloutRefWorker(Worker):
 
             output = self.rollout_sharding_manager.postprocess_data(output)
 
+        else:
+            with self.rollout_sharding_manager:
+                log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
+
+                prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+                output = self.rollout.generate_sequences(prompts=prompts)
+
+                log_gpu_memory_usage("After rollout generation", logger=logger)
+
+                output = self.rollout_sharding_manager.postprocess_data(output)
+
         output = output.to("cpu")
 
         # clear kv cache
-        get_torch_device().empty_cache()
+        if not self._rollout_resident:
+            get_torch_device().empty_cache()
         return output
 
 

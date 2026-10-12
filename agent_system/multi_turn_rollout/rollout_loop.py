@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
+from collections.abc import Mapping
+
 import torch
 import numpy as np
 from verl import DataProto
@@ -24,6 +27,55 @@ from agent_system.environments import EnvironmentManagerBase
 from agent_system.agent import BaseOrchestra
 from typing import List, Dict, Any, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+
+
+def _unique_worker_groups(actor_rollout_wg):
+    """Return each actor rollout worker group once.
+
+    GMAS passes a mapping from model/agent ids to worker groups.  Keeping this
+    helper tolerant of a single worker group preserves the collector's use in
+    non-GMAS configurations, while the identity check avoids beginning and
+    ending a shared group more than once.
+    """
+    groups = actor_rollout_wg.values() if isinstance(actor_rollout_wg, Mapping) else (actor_rollout_wg,)
+    unique_groups = []
+    seen = set()
+    for group in groups:
+        if group is None or id(group) in seen:
+            continue
+        seen.add(id(group))
+        if callable(getattr(group, "begin_rollout", None)) and callable(getattr(group, "end_rollout", None)):
+            unique_groups.append(group)
+    return unique_groups
+
+
+@contextmanager
+def rollout_residency_scope(actor_rollout_wg):
+    """Keep selected SGLang engines resident for one complete rollout.
+
+    Activation is lazy: begin_rollout only arms a worker, and that worker
+    synchronizes weights when its first generation request arrives.  This
+    prevents router branches that are never selected from consuming memory or
+    synchronization time.  The finally block releases every worker that was
+    armed, including when environment interaction or generation raises.
+    """
+    groups = _unique_worker_groups(actor_rollout_wg)
+    started = []
+    try:
+        for group in groups:
+            started.append(group)
+            group.begin_rollout()
+        yield
+    finally:
+        first_error = None
+        for group in reversed(started):
+            try:
+                group.end_rollout()
+            except BaseException as exc:  # release all groups before surfacing an error
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
@@ -297,6 +349,22 @@ class TrajectoryCollector:
         return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings
 
     def multi_turn_loop(
+            self,
+            gen_batch: DataProto,
+            actor_rollout_wg,
+            envs: EnvironmentManagerBase,
+            is_train: bool = True,
+            ) -> DataProto:
+        """Collect one complete rollout while keeping used policies resident."""
+        with rollout_residency_scope(actor_rollout_wg):
+            return self._multi_turn_loop_impl(
+                gen_batch=gen_batch,
+                actor_rollout_wg=actor_rollout_wg,
+                envs=envs,
+                is_train=is_train,
+            )
+
+    def _multi_turn_loop_impl(
             self,
             gen_batch: DataProto, 
             actor_rollout_wg, 

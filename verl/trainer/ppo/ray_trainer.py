@@ -1167,6 +1167,21 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        benchmark = None
+        benchmark_config = self.config.trainer.get("benchmark")
+        if benchmark_config and benchmark_config.get("output_dir"):
+            from verl.trainer.ppo.benchmark import TrainingBenchmark
+
+            available_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+            if self.total_training_steps > available_steps:
+                raise ValueError(
+                    f"Benchmark requests {self.total_training_steps} steps but this dataset/epoch "
+                    f"configuration only provides {available_steps} full batches"
+                )
+            benchmark = TrainingBenchmark(
+                OmegaConf.to_container(self.config, resolve=True), self.total_training_steps
+            )
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
@@ -1189,6 +1204,7 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                input_questions = len(batch)
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1247,6 +1263,13 @@ class RayPPOTrainer:
                     # batch = batch.union(gen_batch_output)
                     del batch
                     batch = gen_batch_output
+
+                    # Capture actual trajectories before per-agent duplication/balancing.
+                    if benchmark is not None:
+                        with _timer("dump_rollout_samples", timing_raw):
+                            metrics.update(benchmark.record_rollouts(
+                                batch, self.tokenizers, self.global_steps, input_questions
+                            ))
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
                         step_rewards_tensor = core_algos.compute_step_discounted_returns(
@@ -1491,6 +1514,8 @@ class RayPPOTrainer:
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
                 # TODO: make a canonical logger that supports various backend
+                if benchmark is not None:
+                    benchmark.record_step(metrics, self.global_steps, batch)
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)

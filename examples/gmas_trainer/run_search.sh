@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Usage: bash examples/gmas_trainer/run_search.sh [train|eval|evaluation] [Hydra overrides...]
-source /data/workspace/xuhaobin/miniconda3/etc/profile.d/conda.sh
-conda activate DrMAS
+# Activate the Miniforge-based training environment in the sbatch job first.
+# WORK_DIR, DATA_DIR and MODEL_DIR can override the local project paths.
 
 set -euo pipefail
 set -x
@@ -9,7 +9,8 @@ set -x
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 source examples/trainer_logging.sh
 
-data_dir=/data/workspace/xuhaobin/xzy/data/MASsearch/drmas_search
+data_dir="${DATA_DIR:-${WORK_DIR:-$PWD}/data/drmas_search}"
+search_url="${SEARCH_URL:-http://127.0.0.1:8001/retrieve}"
 
 MODE=${1:-train}
 if [ "$#" -gt 0 ]; then
@@ -51,7 +52,8 @@ use_kl_in_reward=False
 
 ##################### Agent Configurations #####################
 agent_ids='["Router Agent","Sub Agent 1","Sub Agent 2","Sub Agent 3"]'
-model_ids='["Qwen/Qwen2.5-7B","Qwen/Qwen2.5-7B","Qwen/Qwen2.5-7B","Qwen/Qwen2.5-7B"]'
+model_path="${MODEL_DIR:-${WORK_DIR:-$PWD}/model/Qwen2.5-3B-Instruct}"
+model_ids="[\"$model_path\",\"$model_path\",\"$model_path\",\"$model_path\"]"
 model_sharing=False
 
 orchestra_type=router
@@ -66,6 +68,9 @@ model_name_tag=$(python -c 'import json, sys; print("_".join(model.rsplit("/", 1
 
 experiment_name="gmas_share${model_sharing}_${model_name_tag}"
 
+# Speed-first starting point: retain optimizer states on GPU. Compare CPU weight
+# caching with a Hydra override if repeated FSDP gathers dominate rollout time.
+# SGLang-specific aliases below are passed to Engine and logged at startup.
 run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name router_trainer \
     algorithm.adv_estimator=$algorithm \
     data.train_files="$TRAIN_DATA" \
@@ -81,7 +86,7 @@ run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name
     actor_rollout_ref.actor.optim.lr=null \
     +agent.agent_specific_parameters.actor.optim.lr=$actor_optim_lr \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.response_only_logits=True \
+    ++actor_rollout_ref.actor.response_only_logits=True \
     actor_rollout_ref.actor.use_adaptive_ppo_mini_batch_size=True \
     actor_rollout_ref.actor.ppo_mini_update_num=5 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=null \
@@ -89,7 +94,7 @@ run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=sglang \
@@ -97,9 +102,12 @@ run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
+    ++actor_rollout_ref.rollout.engine_kwargs.sglang.disable_cuda_graph=False \
+    ++actor_rollout_ref.rollout.engine_kwargs.sglang.max_running_requests=1024 \
+    ++actor_rollout_ref.rollout.engine_kwargs.sglang.chunked_prefill_size=-1 \
     actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.rollout.weight_sync_bucket_mb=128 \
-    actor_rollout_ref.rollout.cache_cpu_weights=True \
+    ++actor_rollout_ref.rollout.weight_sync_bucket_mb=128 \
+    ++actor_rollout_ref.rollout.cache_cpu_weights=False \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
@@ -111,8 +119,8 @@ run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     env.env_name=search \
     env.seed=0 \
-    env.search.search_url='http://127.0.0.1:8001/retrieve' \
-    env.search.batch_size=64 \
+    env.search.search_url="$search_url" \
+    ++env.search.batch_size=64 \
     env.max_steps=$max_turn \
     env.rollout.n=$group_size \
     env.rollout.val_n=$val_group_size \

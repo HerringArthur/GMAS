@@ -29,7 +29,7 @@ from uuid import uuid4
 import numpy as np
 import torch
 import torch.distributed as dist
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.openai_api.protocol import Tool
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -228,6 +228,91 @@ class SGLangRollout(BaseRollout):
         if self.config.multi_turn.max_turns is None:
             self.config.multi_turn.max_turns = self.config.max_model_len // 3
 
+    def _get_sglang_engine_kwargs(self) -> dict:
+        """Build the arguments that are actually understood by SGLang.
+
+        The rollout config historically used several vLLM-shaped names.  They
+        are still useful as backend-neutral settings, but passing them
+        verbatim to SGLang would either be ignored or fail because SGLang uses
+        different names.  Translate those settings here and let explicit
+        ``engine_kwargs.sglang`` values take precedence.
+        """
+        engine_kwargs = self.config.get("engine_kwargs", {}) or {}
+        sglang_kwargs = engine_kwargs.get("sglang", {}) if hasattr(engine_kwargs, "get") else {}
+        if sglang_kwargs is None:
+            sglang_kwargs = {}
+        if isinstance(sglang_kwargs, DictConfig):
+            sglang_kwargs = OmegaConf.to_container(deepcopy(sglang_kwargs), resolve=True)
+        else:
+            sglang_kwargs = deepcopy(sglang_kwargs)
+        if not isinstance(sglang_kwargs, dict):
+            raise TypeError(f"rollout.engine_kwargs.sglang must be a mapping, got {type(sglang_kwargs)!r}")
+
+        # ``None`` means use the SGLang default.  Keeping it out of the
+        # constructor is important because some SGLang versions reject an
+        # explicit null for integer/bool server arguments.
+        sglang_kwargs = {key: value for key, value in sglang_kwargs.items() if value is not None}
+
+        # Backend-neutral rollout settings and their SGLang equivalents.  Do
+        # not overwrite an explicit engine_kwargs.sglang value.
+        if "disable_cuda_graph" not in sglang_kwargs and self.config.get("enforce_eager") is not None:
+            sglang_kwargs["disable_cuda_graph"] = bool(self.config.enforce_eager)
+        if "max_running_requests" not in sglang_kwargs and self.config.get("max_num_seqs") is not None:
+            sglang_kwargs["max_running_requests"] = int(self.config.max_num_seqs)
+        if "chunked_prefill_size" not in sglang_kwargs:
+            max_batched_tokens = self.config.get("max_num_batched_tokens")
+            if self.config.get("enable_chunked_prefill"):
+                if max_batched_tokens is not None:
+                    # The backend-neutral flag has no chunk size of its own;
+                    # use the configured token budget as the SGLang chunk.
+                    sglang_kwargs["chunked_prefill_size"] = int(max_batched_tokens)
+            else:
+                # SGLang uses -1 to disable chunked prefill.
+                sglang_kwargs["chunked_prefill_size"] = -1
+        if self.config.get("max_num_batched_tokens") is not None and "max_prefill_tokens" not in sglang_kwargs:
+            logger.info(
+                "SGLang does not use vLLM's max_num_batched_tokens directly; "
+                "set engine_kwargs.sglang.max_prefill_tokens explicitly when supported by the installed SGLang version"
+            )
+        if "context_length" not in sglang_kwargs and self.config.get("max_model_len") is not None:
+            sglang_kwargs["context_length"] = int(self.config.max_model_len)
+
+        return sglang_kwargs
+
+    def _log_sglang_engine_config(self, requested_kwargs: dict):
+        """Log requested and effective SGLang server arguments when exposed."""
+        server_args = getattr(self._engine, "server_args", None)
+        if server_args is None:
+            logger.warning(
+                "SGLang engine was created with %s, but this SGLang version does not expose server_args for post-init verification",
+                requested_kwargs,
+            )
+            return
+
+        tracked_keys = set(requested_kwargs) | {
+            "dtype",
+            "mem_fraction_static",
+            "tp_size",
+            "nnodes",
+            "node_rank",
+            "load_format",
+        }
+        effective = {key: getattr(server_args, key) for key in tracked_keys if hasattr(server_args, key)}
+        missing = sorted(set(requested_kwargs) - set(effective))
+        if missing:
+            logger.warning("SGLang did not expose configured arguments after initialization: %s", missing)
+        mismatches = {
+            key: {"requested": value, "effective": effective[key]}
+            for key, value in requested_kwargs.items()
+            if key in effective and effective[key] != value
+        }
+        if mismatches:
+            logger.warning("SGLang normalized configured arguments: %s", mismatches)
+        logger.info("SGLang requested engine kwargs: %s", requested_kwargs)
+        # Keep the effective values visible with the repository's default WARN
+        # logging level so a cluster run can verify what SGLang accepted.
+        logger.warning("SGLang effective server args: %s", effective)
+
     def _init_inference_engine(self, trust_remote_code, actor_module, port):
         # initialize the inference engine
         nnodes = -(-self._tp_size // len(self.visible_devices_set))
@@ -253,7 +338,8 @@ class SGLangRollout(BaseRollout):
         if first_rank_in_node:
             rank = dist.get_rank()
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-            self._engine = Engine(
+            engine_kwargs = self._get_sglang_engine_kwargs()
+            engine_args = dict(
                 model_path=actor_module,
                 dtype=self.config.dtype,
                 mem_fraction_static=self.config.gpu_memory_utilization,
@@ -277,6 +363,16 @@ class SGLangRollout(BaseRollout):
                 # log_requests_level=2,
                 # max_running_requests=1,
             )
+            reserved_keys = set(engine_args).intersection(engine_kwargs)
+            if reserved_keys:
+                raise ValueError(
+                    "rollout.engine_kwargs.sglang cannot override managed SGLang arguments: "
+                    f"{sorted(reserved_keys)}"
+                )
+            engine_args.update(engine_kwargs)
+            logger.info("Initializing SGLang Engine with arguments: %s", engine_args)
+            self._engine = Engine(**engine_args)
+            self._log_sglang_engine_config(engine_kwargs)
         else:
             self._engine = None
 

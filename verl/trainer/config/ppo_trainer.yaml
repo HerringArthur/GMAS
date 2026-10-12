@@ -137,6 +137,13 @@ actor_rollout_ref:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
       sglang:
         attention_backend: null # null means use the engine default value, available options: flashinfer, triton, flashmla
+        # SGLang names for the backend-neutral rollout controls below.  Null
+        # keeps the translated rollout value (or SGLang's own default).
+        disable_cuda_graph: null
+        max_running_requests: null
+        max_prefill_tokens: null
+        chunked_prefill_size: null
+        context_length: null
     val_kwargs:
       # sampling parameters for validation
       top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -268,6 +275,11 @@ trainer:
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
+  benchmark:
+    output_dir: null # opt-in per-step timing and sampled complete trajectories
+    samples_per_step: 3
+    warmup_steps: 2
+    seed: 42
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1
