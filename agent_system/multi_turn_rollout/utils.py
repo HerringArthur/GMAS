@@ -16,7 +16,7 @@
 import torch
 import numpy as np
 import random
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import math
 from omegaconf import ListConfig
 from PIL import Image
@@ -26,6 +26,43 @@ from verl.models.transformers.qwen2_vl import get_rope_index
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F
 from verl.utils.dataset.rl_dataset import collate_fn
+
+
+def get_valid_action_mask(data: DataProto) -> np.ndarray:
+    """Return the row mask used to decide whether a rollout action is trainable.
+
+    Older rollout producers do not attach ``is_action_valid``.  Such batches
+    remain fully trainable for backwards compatibility.  The mask is kept on
+    the driver as a NumPy array because ``DataProto.select_idxs`` uses NumPy
+    indices for its non-tensor metadata.
+    """
+    flags = data.non_tensor_batch.get("is_action_valid")
+    if flags is None:
+        return np.ones(len(data), dtype=bool)
+    mask = np.asarray(flags, dtype=bool)
+    if mask.ndim != 1 or mask.shape[0] != len(data):
+        raise ValueError(
+            "is_action_valid must be a one-dimensional array aligned with the DataProto rows"
+        )
+    return mask
+
+
+def filter_valid_action_rows(data: DataProto) -> Optional[DataProto]:
+    """Drop protocol-invalid rollout rows before model-side training work.
+
+    Invalid rows are still available in the original rollout batch for
+    diagnostics and benchmark recording.  Returning ``None`` for an all
+    invalid batch lets the trainer skip log-probability, reference, critic,
+    and actor computations instead of constructing a padded copy of rows that
+    cannot contribute to the policy loss.
+    """
+    valid_mask = get_valid_action_mask(data)
+    if valid_mask.all():
+        return data
+    if not valid_mask.any():
+        return None
+    return data.select_idxs(valid_mask)
+
 
 def to_list_of_dict(batch: DataProto) -> list[dict]:
     tensors = batch.batch

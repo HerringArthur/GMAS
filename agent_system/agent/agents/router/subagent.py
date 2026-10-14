@@ -39,13 +39,21 @@ to the router for review. The final answer must directly and fully answer the
 original task, preserve essential qualifiers, and agree with your reasoning.
 Put reasoning in <think> </think>. Follow the environment-specific rules below.
 
-Include nonempty work and end every response with exactly one control tag:
-- <handoff>CONTINUE</handoff> to continue working as the current worker.
-- <handoff>HANDOFF</handoff> to return control to the router. This can accompany
-  partial work or a final answer; HANDOFF alone does not mean the task is solved.
+Include nonempty work and end every response with exactly one control tag. Both
+control values return control to the Router for review:
+- <handoff>CONTINUE</handoff> to indicate that more work may be useful.
+- <handoff>HANDOFF</handoff> to request a new assignment or final review. This can
+  accompany partial work or a final answer; HANDOFF alone does not mean the task is solved.
 
 After a final answer, use HANDOFF for review. Place the control tag outside all
 other tags and output nothing after </handoff>.
+
+Protocol examples (copy the tag spelling and order exactly):
+  <search>one query</search><handoff>CONTINUE</handoff>
+  <answer>short final answer</answer><handoff>HANDOFF</handoff>
+  <think>intermediate reasoning</think><handoff>CONTINUE</handoff>
+Never use Markdown bullets around protocol tags, change tag capitalization, emit
+more than one search/answer block, or write anything after </handoff>.
 """
 
 
@@ -72,7 +80,8 @@ Assess what the evidence establishes and what work remains.
   control tag. No search or answer block is required for intermediate work.
 - If information is missing, output <search>targeted query</search> outside
   <think>. Do not repeat a query whose results already answer the question.
-  Use CONTINUE to examine the results yourself, or HANDOFF to return to the router.
+  Use either control tag to return to the Router after the search; the Router
+  decides whether to reselect a worker or finish.
 - As soon as the evidence and reasoning support a complete answer, output
   <answer>final answer</answer> outside <think>, followed by HANDOFF. Answer the
   original question concisely and completely. Put explanations in <think>.
@@ -154,19 +163,88 @@ class SubAgent(BaseAgent):
         return decision
 
     @staticmethod
+    def _canonicalize_tags(response: str) -> str:
+        """Canonicalize tag capitalization without changing tag contents."""
+        for tag in ('think', 'search', 'answer', 'handoff'):
+            response = re.sub(
+                rf'</?{tag}\s*>',
+                lambda match, tag=tag: (
+                    f'</{tag}>' if match.group(0).startswith('</') else f'<{tag}>'
+                ),
+                response,
+                flags=re.IGNORECASE,
+            )
+        return response
+
+    @staticmethod
+    def normalize_response(response: str, search_enabled: bool = False) -> Tuple[str, bool]:
+        """Repair only unambiguous worker outputs at the orchestration boundary.
+
+        A model often stops immediately after a complete search or answer block,
+        even though the prompt asks for a trailing handoff tag. Such a response
+        has enough structure to execute a search and continue with the same
+        worker. Answers and intermediate work still require an explicit handoff
+        because silently submitting a candidate changes the training target.
+        Incomplete or ambiguous actions are
+        left untouched so they still receive correction feedback and remain
+        visible as invalid training rows.
+        """
+        canonical = SubAgent._canonicalize_tags(response)
+        if SubAgent.parse_response(canonical) != 'invalid':
+            if search_enabled:
+                _, _, formatting_error = SubAgent.search_action(canonical)
+                if formatting_error:
+                    # Keep malformed actions invalid so correction feedback is
+                    # shown and the raw form cannot enter shared history.
+                    return canonical, False
+            return canonical, canonical != response
+
+        # A foreign control tag must not be reinterpreted as worker progress.
+        if re.search(r'</?route\b', canonical, flags=re.IGNORECASE):
+            return response, False
+        if re.search(r'</?handoff\b', canonical, flags=re.IGNORECASE):
+            # A handoff that is not a complete terminal tag is ambiguous.
+            return response, False
+
+        action = ''
+        if search_enabled:
+            # A missing handoff can be repaired, including a leading Markdown
+            # list marker, but the repaired text must itself be canonical.
+            repair_source = re.sub(
+                r'(?m)^(\s*)(?:[-*•]|\d+[.)])\s+(?=<(?:search|answer)\b)',
+                r'\1',
+                canonical,
+            )
+            action, is_search, error = SubAgent.search_action(repair_source)
+            if error:
+                return response, False
+            if not action or not is_search:
+                return response, False
+            decision = 'CONTINUE'
+        else:
+            return response, False
+
+        repaired = repair_source.rstrip() + f'<handoff>{decision}</handoff>'
+        if SubAgent.parse_response(repaired) == 'invalid':
+            return response, False
+        return repaired, True
+
+    @staticmethod
     def search_action(response: str) -> Tuple[str, bool, str]:
         """Extract a Search action or accept intermediate work without an action.
 
         An empty action with no error is valid intermediate work, not a final
         candidate. Control-tag validity is checked separately by parse_response.
         """
-        work = re.sub(r'<handoff>\s*(CONTINUE|HANDOFF)\s*</handoff>\s*$', '', response).strip()
-        visible = re.sub(r'<think>.*?</think>', '', work, flags=re.DOTALL)
-        blocks = list(re.finditer(r'<(search|answer)>(.*?)</\1>', visible, flags=re.DOTALL))
+        work = re.sub(r'<handoff>\s*(CONTINUE|HANDOFF)\s*</handoff>\s*$', '', response,
+                      flags=re.IGNORECASE).strip()
+        visible = re.sub(r'<think>.*?</think>', '', work, flags=re.DOTALL | re.IGNORECASE)
+        blocks = list(re.finditer(r'<(search|answer)>(.*?)</\1>', visible,
+                                  flags=re.DOTALL | re.IGNORECASE))
         if not blocks:
-            if re.search(r'</?(?:search|answer)\b', visible):
+            if re.search(r'</?(?:search|answer)\b', visible, flags=re.IGNORECASE):
                 return '', False, 'Complete the search or answer tags, or remove them when sharing intermediate work.'
-            if not re.sub(r'</?think>', '', work).strip():
+            if not re.sub(r'</?think>', '', work, flags=re.IGNORECASE).strip():
                 return '', False, 'Provide nonempty intermediate work, a search query, or a final answer before the control tag.'
             return '', False, ''
         if len(blocks) > 1:
@@ -176,10 +254,17 @@ class SubAgent(BaseAgent):
         block = blocks[0]
         tag, content = block.groups()
         remainder = visible[:block.start()] + visible[block.end():]
-        if re.search(r'</?(?:search|answer)\b', remainder + content):
+        if re.search(r'</?(?:search|answer)\b', remainder + content, flags=re.IGNORECASE):
             return '', False, 'Remove extra, nested, or incomplete action tags. Output only one complete search or answer block.'
+        prefix = visible[:block.start()]
+        suffix = visible[block.end():]
+        if re.match(r'^\s*(?:[-*•]|\d+[.)])\s*', prefix):
+            return '', False, 'Remove list markers around the action; emit one canonical action tag.'
+        if suffix.strip():
+            return '', False, 'Put explanations inside <think> and output nothing after the action block.'
         if not content.strip():
             return '', False, 'The action is empty. Supply a search query or a short final answer inside its tags.'
+        tag = tag.lower()
         return f'<{tag}>{content.strip()}</{tag}>', tag == 'search', ''
 
     def call(
@@ -210,12 +295,23 @@ class SubAgent(BaseAgent):
             **active_kwargs,
         )
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
+        normalized_responses = []
+        protocol_repaired = []
+        for response in text_responses:
+            normalized, repaired = self.normalize_response(
+                response,
+                search_enabled='search' in self.config.env.env_name.lower(),
+            )
+            normalized_responses.append(normalized)
+            protocol_repaired.append(repaired)
+        text_responses = normalized_responses
 
         decisions = [
             self.parse_response(response) if active else "invalid"
             for response, active in zip(text_responses, agent_active_mask)
         ]
-        valids = [decision != 'invalid' for decision in decisions]
+        protocol_valids = [decision != 'invalid' for decision in decisions]
+        valids = protocol_valids.copy()
         if 'search' in self.config.env.env_name.lower():
             if self.search_feedback is None or len(self.search_feedback) != len(text_responses):
                 self.search_feedback = [''] * len(text_responses)
@@ -224,7 +320,7 @@ class SubAgent(BaseAgent):
             for i, active in enumerate(agent_active_mask):
                 if not active:
                     continue
-                if not valids[i]:
+                if not protocol_valids[i]:
                     error = ('Provide nonempty work with complete, non-nested <think> tags if used, '
                              'then exactly one <handoff>CONTINUE</handoff> or '
                              '<handoff>HANDOFF</handoff> outside <think>. Nothing may follow it.')
@@ -236,9 +332,46 @@ class SubAgent(BaseAgent):
                     error += (' This is the final step: provide <answer>final answer</answer>'
                               '<handoff>HANDOFF</handoff>; intermediate work alone, searches, '
                               'and CONTINUE are not allowed.')
-                self.search_feedback[i] = error
+                # A syntactic repair is executable only when the resulting
+                # response also satisfies the environment-step semantics.
+                if error:
+                    protocol_repaired[i] = False
+                self.search_feedback[i] = error or (
+                    'Your previous response was executable but had a protocol mismatch. '
+                    'Use exactly one canonical action followed by <handoff>CONTINUE</handoff> '
+                    'or <handoff>HANDOFF</handoff>; do not use Markdown bullets or change tag capitalization.'
+                    if protocol_repaired[i] else ''
+                )
                 valids[i] = not bool(error)
+        else:
+            # Math and other non-search workers also need explicit correction
+            # feedback now that invalid text is hidden from shared history.
+            if self.search_feedback is None or len(self.search_feedback) != len(text_responses):
+                self.search_feedback = [''] * len(text_responses)
+            for i, active in enumerate(agent_active_mask):
+                if not active:
+                    continue
+                if not protocol_valids[i]:
+                    self.search_feedback[i] = (
+                        'Your previous response was invalid and has been omitted from shared history. '
+                        'Provide nonempty work, then exactly one <handoff>CONTINUE</handoff> or '
+                        '<handoff>HANDOFF</handoff> outside any <think> block, with nothing after it.'
+                    )
+                elif protocol_repaired[i]:
+                    self.search_feedback[i] = (
+                        'Use the canonical handoff protocol exactly; the repaired response was omitted '
+                        'from shared history and will not receive protocol credit.'
+                    )
+                else:
+                    self.search_feedback[i] = ''
         batch.non_tensor_batch['handoff_decision'] = np.array(decisions, dtype=object)
-        batch.non_tensor_batch['is_action_valid'] = np.array(valids, dtype=bool)
+        batch.non_tensor_batch['protocol_repaired'] = np.array(protocol_repaired, dtype=bool)
+        # Repaired responses can be executed to preserve the trajectory, but are
+        # kept invalid for PPO so the model is trained toward the canonical
+        # protocol rather than receiving credit for a synthetic handoff.
+        batch.non_tensor_batch['is_action_valid'] = np.array(
+            [valid and not repaired for valid, repaired in zip(valids, protocol_repaired)],
+            dtype=bool,
+        )
         batch.non_tensor_batch['env_step'] = np.array([step] * len(text_responses), dtype=object)
         return batch, text_responses

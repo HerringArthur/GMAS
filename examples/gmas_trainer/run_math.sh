@@ -53,7 +53,7 @@ model_ids='["Qwen/Qwen3-4B","Qwen/Qwen3-4B","Qwen/Qwen3-4B","Qwen/Qwen3-4B"]'
 model_sharing=False
 
 orchestra_type=router
-max_loop_num=8 # Internal Router/worker loops per environment step.
+max_loop_num=4 # Internal Router/worker loops per environment step.
 
 # Per-agent overrides, ordered as Router, Sub Agent 1, Sub Agent 2, Sub Agent 3.
 actor_optim_lr='[1e-6,1e-6,1e-6,1e-6]'

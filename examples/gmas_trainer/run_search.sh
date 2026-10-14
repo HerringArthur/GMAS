@@ -58,7 +58,7 @@ model_sharing=False
 
 orchestra_type=router
 max_turn=4 # Environment interactions, including searches.
-max_loop_num=8 # Internal Router/worker loops per environment step.
+max_loop_num=4 # Internal Router/worker loops per environment step.
 
 # Per-agent overrides, ordered as Router, Sub Agent 1, Sub Agent 2, Sub Agent 3.
 actor_optim_lr='[1e-6,1e-6,1e-6,1e-6]'
@@ -112,7 +112,7 @@ run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
-    actor_rollout_ref.actor.invalid_action_penalty_coef=0.01 \
+    actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     algorithm.group_by_agent_id=$group_by_agent_id \
     algorithm.credit_mode=$credit_mode \
     algorithm.norm_adv_by_std_in_grpo=$norm_adv_by_std_in_grpo \

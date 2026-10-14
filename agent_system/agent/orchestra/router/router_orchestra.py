@@ -25,6 +25,7 @@ from verl.utils.reward_score.math_dapo import last_boxed_only_string
 
 from agent_system.agent.agents.router import RouterAgent, SubAgent
 from agent_system.agent.agents.router.context import CollaborationContext, WorkRecord
+from agent_system.agent.agents.router.search_context import split_observation
 from agent_system.agent.orchestra.base import BaseOrchestra, update_team_context, update_text_action
 
 
@@ -64,7 +65,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         )
         self.agent_order = self.worker_ids
         router_config = getattr(self.config.agent.orchestra, 'router', None)
-        self.max_loop_num = getattr(router_config, 'max_loop_num', 8)
+        self.max_loop_num = getattr(router_config, 'max_loop_num', 4)
         if not isinstance(self.max_loop_num, int) or isinstance(self.max_loop_num, bool) or self.max_loop_num < 1:
             raise ValueError("agent.orchestra.router.max_loop_num must be a positive integer.")
         self.search_enabled = 'search' in self.config.env.env_name.lower()
@@ -76,8 +77,12 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.candidate_authors = None
         self.candidate_responses = None
         self.candidate_repeat_counts = None
+        self.candidate_evidence = None
+        self.candidate_quality = None
+        self.candidate_review = None
         self.routed_agents = None
         self.routing_instructions = None
+        self.last_worker_decisions = None
         self.return_reasons = None
         self.work_records = None
         self.candidate_records = None
@@ -105,8 +110,12 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.candidate_authors = None
         self.candidate_responses = None
         self.candidate_repeat_counts = None
+        self.candidate_evidence = None
+        self.candidate_quality = None
+        self.candidate_review = None
         self.routed_agents = None
         self.routing_instructions = None
+        self.last_worker_decisions = None
         self.return_reasons = None
         self.work_records = None
         self.candidate_records = None
@@ -126,8 +135,12 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             self.candidate_authors = [''] * batch_size
             self.candidate_responses = [''] * batch_size
             self.candidate_repeat_counts = [0] * batch_size
+            self.candidate_evidence = [tuple() for _ in range(batch_size)]
+            self.candidate_quality = ['none'] * batch_size
+            self.candidate_review = ['unreviewed'] * batch_size
             self.routed_agents = [''] * batch_size
             self.routing_instructions = [''] * batch_size
+            self.last_worker_decisions = [''] * batch_size
             self.work_records = [[] for _ in range(batch_size)]
             self.candidate_records = [None] * batch_size
             self.assignment_turns = [0] * batch_size
@@ -169,6 +182,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             'parent_prefix_key': tuple(),
             'router_feedback': '',
             'return_reason': '',
+            'protocol_repaired': False,
         }
         for key, default in defaults.items():
             if key not in batch.non_tensor_batch:
@@ -183,6 +197,10 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             'candidate_answer': (self.candidate_answers, ''),
             'candidate_author': (self.candidate_authors, ''),
             'candidate_repeat_count': (self.candidate_repeat_counts, 0),
+            'candidate_evidence': (self.candidate_evidence, tuple()),
+            'candidate_quality': (self.candidate_quality, 'none'),
+            'candidate_review': (self.candidate_review, 'unreviewed'),
+            'last_worker_decision': (self.last_worker_decisions, ''),
         }
         for key, (values, empty) in state.items():
             if key not in batch.non_tensor_batch:
@@ -190,6 +208,26 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                     values[i] if active[i] else empty for i in range(len(batch))
                 ])
         super().save_to_buffer(name, batch)
+
+    @staticmethod
+    def _update_visible_team_context(
+        agent_id: str,
+        team_context: List[str],
+        text_responses: List[str],
+        active_mask: np.ndarray,
+        protocol_valid_mask: np.ndarray,
+    ) -> List[str]:
+        """Share only canonical responses with later model prompts.
+
+        Invalid and protocol-repaired generations remain in the rollout batch
+        and in ``WorkRecord`` for diagnostics and training labels, but exposing
+        their raw text in shared context teaches the next generation to imitate
+        malformed tags, list prefixes, or trailing explanations.  Correction
+        feedback is carried separately by the agent, so invalid text can be
+        omitted completely here.
+        """
+        visible_mask = np.asarray(active_mask, dtype=bool) & np.asarray(protocol_valid_mask, dtype=bool)
+        return update_team_context(agent_id, team_context, text_responses, visible_mask)
 
     def _environment_action(self, response: str) -> Tuple[str, bool]:
         """Return a tool request or formatted candidate, never Math/Search partial work."""
@@ -225,10 +263,51 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             records=tuple(self.work_records[i]),
             loop_round=loop_round,
             loop_limit=self.max_loop_num,
+            candidate_evidence=tuple(self.candidate_evidence[i]),
+            candidate_quality=self.candidate_quality[i],
+            candidate_review=self.candidate_review[i],
+            last_worker_decision=self.last_worker_decisions[i],
         ) if active else None for i, active in enumerate(active_mask)]
 
-    def _record_candidate(self, index: int, action: str, author: str, response: str, record: WorkRecord) -> None:
-        """Count consecutive candidate outputs by extracted text, without grading them."""
+    @staticmethod
+    def _candidate_quality_hint(answer: str, evidence: Tuple[Tuple[str, str], ...], search_enabled: bool,
+                                response: str) -> str:
+        """Return a transparent support hint; the Router remains the quality judge."""
+        if search_enabled:
+            if not evidence:
+                return 'unsupported'
+            normalize = lambda text: re.sub(r'\s+', ' ', text.casefold()).strip()
+            normalized_answer = normalize(answer)
+            corpus = normalize(' '.join(result for _, result in evidence))
+            if normalized_answer and normalized_answer in corpus:
+                return 'directly_supported'
+            return 'evidence_available_needs_judgment'
+        if response.strip():
+            visible = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+            if visible:
+                return 'reasoning_available_needs_verification'
+        return 'unsupported'
+
+    def _evidence_snapshot(self, observation: str) -> Tuple[Tuple[str, str], ...]:
+        """Capture the retrieved query/result pairs present when a candidate is emitted."""
+        if not self.search_enabled:
+            return tuple()
+        try:
+            _, evidence = split_observation(observation)
+        except (AttributeError, TypeError, ValueError):
+            return tuple()
+        return tuple((str(query), str(result)) for query, result in evidence)
+
+    def _record_candidate(
+        self,
+        index: int,
+        action: str,
+        author: str,
+        response: str,
+        record: WorkRecord,
+        evidence: Tuple[Tuple[str, str], ...],
+    ) -> None:
+        """Save a candidate together with its evidence snapshot and support hint."""
         if self.search_enabled:
             answer = action[len('<answer>'):-len('</answer>')].strip()
         elif self.math_enabled:
@@ -245,6 +324,11 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.candidate_authors[index] = author
         self.candidate_responses[index] = response
         self.candidate_records[index] = record
+        self.candidate_evidence[index] = tuple(evidence)
+        self.candidate_quality[index] = self._candidate_quality_hint(
+            answer, tuple(evidence), self.search_enabled, response,
+        )
+        self.candidate_review[index] = 'unreviewed'
 
     def _record_return_reasons(self, active_masks: np.ndarray) -> None:
         """Mark only the last executed row for each sample in this run()."""
@@ -267,8 +351,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
     ) -> Tuple[List[str], List[Dict[str, Any]]]:
         """Route, execute, and update samples until FINISH, search, or the loop limit.
 
-        CONTINUE keeps the current worker; HANDOFF schedules another router call.
-        Router FINISH submits the latest available worker result for that sample.
+        Both worker control values schedule another Router review. Router FINISH
+        submits the latest available worker result for that sample.
         An answer tag is an environment format, not an internal stop signal.
         Search yields to envs.step(); the next env_obs supplies search history.
         Invalid routes/decisions are retried within the same finite loop budget.
@@ -305,9 +389,9 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                     step=step,
                     collaboration_context=self._context_snapshot(router_mask, loop_index + 1),
                 )
-                team_context = update_team_context(self.ROUTER_AGENT, team_context, text_responses, router_mask)
 
                 selections = batch.non_tensor_batch['selected_agent']
+                executable_routes = batch.non_tensor_batch['is_action_valid'] | batch.non_tensor_batch['protocol_repaired']
                 finish_requests = router_mask & (selections == RouterAgent.FINISH)
                 can_submit = np.array([bool(action) for action in self.submission_actions], dtype=bool)
                 # Finishing before any result exists is invalid, so retry the router
@@ -325,10 +409,21 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                                 f'Select a worker to produce {candidate_format} from the available work.')
                     router.search_feedback[i] = feedback
                     batch.non_tensor_batch['router_feedback'][i] = feedback
-                finished = finish_requests & can_submit & batch.non_tensor_batch['is_action_valid']
+                # Keep malformed route text out of future prompts while still
+                # retaining it in the rollout buffer as an invalid training row.
+                team_context = self._update_visible_team_context(
+                    self.ROUTER_AGENT,
+                    team_context,
+                    text_responses,
+                    router_mask,
+                    batch.non_tensor_batch['is_action_valid'],
+                )
+                finished = finish_requests & can_submit & executable_routes
                 pending_mask[finished] = False
                 self.return_reasons[finished] = 'finish'
-                valid_routes = router_mask & np.isin(selections, self.worker_ids) & batch.non_tensor_batch['is_action_valid']
+                for i in np.flatnonzero(finished):
+                    self.candidate_review[i] = 'accepted'
+                valid_routes = router_mask & np.isin(selections, self.worker_ids) & executable_routes
                 router_paths = [tuple(path) for path in self.agent_paths]
                 for i in np.flatnonzero(router_mask):
                     record = self._record_work(
@@ -342,6 +437,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                     self.routed_agents[i] = str(selections[i])
                     # A valid route without an instruction clears the old one.
                     self.routing_instructions[i] = batch.non_tensor_batch['routing_instruction'][i]
+                    if self.submission_actions[i]:
+                        self.candidate_review[i] = 'needs_verification'
                     child_path = parent_paths[i] + (str(selections[i]),)
                     self.agent_paths[i] = list(child_path)
                     self.segment_parent_paths[i] = parent_paths[i]
@@ -365,7 +462,6 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                     step=step,
                     collaboration_context=self._context_snapshot(agent_mask, loop_index + 1),
                 )
-                team_context = update_team_context(agent_id, team_context, text_responses, agent_mask)
                 worker_paths = [tuple(path) if agent_mask[i] else tuple() for i, path in enumerate(self.agent_paths)]
                 worker_parent_paths = [
                     self.segment_parent_paths[i] if agent_mask[i] else tuple()
@@ -377,22 +473,44 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                     worker_parent_paths,
                 )
                 decisions = batch.non_tensor_batch['handoff_decision']
-                valid_mask = agent_mask & np.isin(decisions, ['CONTINUE', 'HANDOFF']) & batch.non_tensor_batch['is_action_valid']
+                executable_worker = batch.non_tensor_batch['is_action_valid'] | batch.non_tensor_batch['protocol_repaired']
+                valid_mask = agent_mask & np.isin(decisions, ['CONTINUE', 'HANDOFF']) & executable_worker
                 agent_actions = [''] * batch_size
                 search_mask = np.zeros(batch_size, dtype=bool)
                 for i in np.flatnonzero(valid_mask):
                     agent_actions[i], search_mask[i] = self._environment_action(text_responses[i])
                 action_mask = valid_mask & np.array([bool(action) for action in agent_actions], dtype=bool)
                 text_actions = update_text_action(text_actions, agent_actions, action_mask)
+                # Invalid/protocol-repaired worker text is available in the
+                # buffer and correction feedback, but never becomes imitation
+                # context for the next worker or Router call.
+                team_context = self._update_visible_team_context(
+                    agent_id,
+                    team_context,
+                    text_responses,
+                    agent_mask,
+                    batch.non_tensor_batch['is_action_valid'],
+                )
                 for i in np.flatnonzero(agent_mask):
                     kind = ('invalid' if not valid_mask[i] else 'search' if search_mask[i]
                             else 'answer' if action_mask[i] else 'intermediate')
-                    record = self._record_work(i, step, agent_id, kind, valid_mask[i], text_responses[i])
+                    record = self._record_work(
+                        i, step, agent_id, kind,
+                        bool(batch.non_tensor_batch['is_action_valid'][i]), text_responses[i],
+                    )
                     if action_mask[i] and not search_mask[i]:
-                        self._record_candidate(i, agent_actions[i], agent_id, text_responses[i], record)
+                        evidence = self._evidence_snapshot(env_obs['text'][i])
+                        self._record_candidate(
+                            i, agent_actions[i], agent_id, text_responses[i], record, evidence,
+                        )
 
-                # Step 3: CONTINUE keeps the worker; HANDOFF requests new routing.
-                self.current_agents[valid_mask & (decisions == 'HANDOFF')] = ''
+                # Step 3: both CONTINUE and HANDOFF return control to the Router.
+                # Invalid responses remain with the same worker for correction.
+                for i in np.flatnonzero(valid_mask):
+                    self.last_worker_decisions[i] = str(decisions[i])
+                    self.current_agents[i] = ''
+                    if agent_actions[i] and not search_mask[i]:
+                        self.candidate_review[i] = 'unreviewed'
                 # Return searches to the environment before generating again.
                 pending_mask[search_mask] = False
                 self.return_reasons[search_mask] = 'search'

@@ -29,6 +29,10 @@ class CollaborationContext:
     records: Tuple[WorkRecord, ...] = ()
     loop_round: int = 0
     loop_limit: int = 0
+    candidate_evidence: Tuple[Tuple[str, str], ...] = ()
+    candidate_quality: str = 'none'
+    candidate_review: str = 'unreviewed'
+    last_worker_decision: str = ''
 
 
 class ContextTokenCache:
@@ -201,6 +205,19 @@ def collaboration_sections(state, agent_name, fallback_history):
         message = 'No worker assignment has been recorded.' if agent_name == 'Router Agent' else 'No current assignment for this worker.'
         core.append(title + '\n' + message)
 
+    if agent_name == 'Router Agent' and state.last_worker_decision:
+        previous_worker = state.assigned_worker or 'the previous worker'
+        core.append(
+            '# Previous worker control\n'
+            f'{previous_worker} returned <handoff>{state.last_worker_decision}</handoff>. '
+            'Every valid worker response is reviewed by the Router before another worker turn. '
+            + (
+                'A candidate exists; prefer a different worker for independent verification when one is available.'
+                if state.last_worker_decision == 'HANDOFF' and state.candidate_action
+                else 'Decide whether to finish, continue verification, or assign the next worker.'
+            )
+        )
+
     if state.candidate_action:
         record = state.candidate_record
         if record is None:
@@ -208,19 +225,36 @@ def collaboration_sections(state, agent_name, fallback_history):
         core.append('# Candidate answer (awaiting review)\n'
                     f'Author: {record.author}; turn: {record.turn}; step: {record.env_step}\n'
                     f'Consecutive occurrences of this answer text: {state.candidate_repeat_count}\n'
+                    f'Heuristic evidence status: {state.candidate_quality}\n'
+                    f'Router review status: {state.candidate_review}\n'
                     'Candidate (verbatim):\n' + state.candidate_action)
         support = candidate_work(state)
         if support:
+            # Keep the candidate's own reasoning ahead of older history when
+            # the prompt budget is tight.  This is the most relevant support
+            # for the Router's quality review; historical records can be
+            # abbreviated first.
             groups.append(('# Work accompanying the candidate (source excerpts, unverified)', [
                 (record_label(record), support, (record.author, support))
-            ], 1))
+            ], 5))
         else:
             core.append('# Work accompanying the candidate\nNo accompanying reasoning was supplied.')
+        if state.candidate_evidence:
+            groups.append(('# Evidence attached to candidate (review this support)', [
+                (f'Candidate evidence {index + 1}', f'Query: {query}\n{result}', (query, result))
+                for index, (query, result) in enumerate(state.candidate_evidence)
+            ], 4))
+        else:
+            core.append('# Evidence attached to candidate\nNo retrieved evidence was captured.')
     else:
         core.append('# Candidate answer (awaiting review)\nNo candidate answer has been saved.')
 
+    # Invalid generations stay in WorkRecord for diagnostics and PPO labels,
+    # but must not be presented as demonstrations in the next prompt.  The
+    # correction feedback section already tells the same agent what to fix.
     records = [record for record in state.records
-               if record.turn != state.assignment_turn
+               if record.valid
+               and record.turn != state.assignment_turn
                and (state.candidate_record is None or record.turn != state.candidate_record.turn)]
     if records:
         groups.append(('# Recent work (historical; validity refers to protocol, not correctness)', [
