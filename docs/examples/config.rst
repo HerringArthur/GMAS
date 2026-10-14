@@ -341,6 +341,16 @@ Reference model will be enabled when ``actor.use_kl_loss`` or/and ``algorithm.us
     - ``triton``: Use triton attention backend.
     - ``flashmla``: Use flashmla attention backend.
 
+  - ``disable_cuda_graph``: SGLang equivalent of ``enforce_eager``; set to
+    ``False`` to allow CUDA graph capture.
+  - ``max_running_requests``: Maximum number of concurrent SGLang requests;
+    ``max_num_seqs`` is translated to this value when it is not specified.
+  - ``chunked_prefill_size``: SGLang chunk size for prefill; ``-1`` disables
+    chunked prefill.
+  - ``max_prefill_tokens``: Optional SGLang prefill token limit, if supported
+    by the installed SGLang version.
+  - ``context_length``: Optional SGLang context length override.
+
 - ``actor_rollout_ref.rollout.ignore_eos``: Whether to ignore the EOS
   token and continue generating tokens after the EOS token is generated.
 

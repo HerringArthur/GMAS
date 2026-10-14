@@ -10,7 +10,7 @@ agent:
   use_agent_memory: false
   orchestra:
     router:
-      max_loop_num: 8
+      max_loop_num: 4
 
 env:
   env_name: math

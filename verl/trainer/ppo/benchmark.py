@@ -48,7 +48,8 @@ class TrainingBenchmark:
         "agent_id", "wg_id", "env_step", "selected_agent", "handoff_decision",
         "is_action_valid", "agent_path", "prefix_key", "parent_prefix_key",
         "routed_agent", "routing_instruction", "router_feedback", "return_reason",
-        "candidate_answer", "candidate_author", "candidate_repeat_count", "rewards",
+        "candidate_answer", "candidate_author", "candidate_repeat_count", "candidate_evidence",
+        "candidate_quality", "candidate_review", "last_worker_decision", "protocol_repaired", "rewards",
     )
     EPISODE_FIELDS = ("uid", "episode_rewards", "episode_lengths", "tool_callings", "pass", "data_source")
 
@@ -86,6 +87,21 @@ class TrainingBenchmark:
             "benchmark/response_tokens": response_tokens,
             **{f"benchmark/rollout_rows/{wg}": count for wg, count in counts.items()},
         }
+        valid_flags = nt.get("is_action_valid")
+        if valid_flags is None:
+            valid_mask = [True] * len(batch)
+        else:
+            valid_mask = [bool(flag) for flag in valid_flags]
+        metrics["benchmark/valid_rollout_rows"] = sum(valid_mask)
+        valid_counts = Counter(
+            str(wg) for wg, valid in zip(nt["wg_id"], valid_mask) if valid
+        )
+        metrics.update({
+            f"benchmark/valid_rollout_rows/{wg}": count
+            for wg, count in valid_counts.items()
+        })
+        if "protocol_repaired" in nt:
+            metrics["benchmark/protocol_repaired"] = sum(bool(item) for item in nt["protocol_repaired"])
         if not self.samples_per_step:
             return metrics
 
@@ -148,9 +164,14 @@ class TrainingBenchmark:
         training_counts = Counter(str(wg) for wg in training_batch.non_tensor_batch["wg_id"])
         for wg, count in training_counts.items():
             metrics[f"benchmark/training_rows/{wg}"] = count
-            metrics[f"benchmark/copied_rows/{wg}"] = count - metrics[f"benchmark/rollout_rows/{wg}"]
+            source_count = metrics.get(
+                f"benchmark/valid_rollout_rows/{wg}",
+                metrics[f"benchmark/rollout_rows/{wg}"],
+            )
+            metrics[f"benchmark/copied_rows/{wg}"] = count - source_count
         metrics["benchmark/training_rows"] = len(training_batch)
-        metrics["benchmark/copied_rows"] = len(training_batch) - metrics["benchmark/rollout_rows"]
+        source_rows = metrics.get("benchmark/valid_rollout_rows", metrics["benchmark/rollout_rows"])
+        metrics["benchmark/copied_rows"] = len(training_batch) - source_rows
         metrics["benchmark/step_excluding_samples_s"] = step_s - dump_s
         metrics["benchmark/questions_per_s"] = metrics["benchmark/questions"] / step_s
         row = {

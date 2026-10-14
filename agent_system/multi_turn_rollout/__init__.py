@@ -14,4 +14,10 @@
 # limitations under the License.
 
 from .rollout_loop import TrajectoryCollector, MultiAgentTrajectoryCollector
-from .utils import adjust_batch, split_batch_by_wg_ids, combine_batches
+from .utils import (
+    adjust_batch,
+    split_batch_by_wg_ids,
+    combine_batches,
+    get_valid_action_mask,
+    filter_valid_action_rows,
+)
