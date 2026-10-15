@@ -64,7 +64,14 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 
-from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch, split_batch_by_wg_ids, combine_batches
+from agent_system.multi_turn_rollout import (
+    TrajectoryCollector,
+    adjust_batch,
+    split_batch_by_wg_ids,
+    combine_batches,
+    get_valid_action_mask,
+    filter_valid_action_rows,
+)
 from agent_system.agent.utils import build_wg_ids, normalize_agent_id, normalize_model_id
 
 WorkerType = Type[Worker]
@@ -1263,6 +1270,7 @@ class RayPPOTrainer:
                     # batch = batch.union(gen_batch_output)
                     del batch
                     batch = gen_batch_output
+                    rollout_valid_action_mask = get_valid_action_mask(batch)
 
                     # Capture actual trajectories before per-agent duplication/balancing.
                     if benchmark is not None:
@@ -1278,214 +1286,234 @@ class RayPPOTrainer:
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
                     
-                    # multiagent_batch (Dict[str, DataProto]): Dictionary mapping unique_wg_ids to their respective DataProto batches
+                    # Record validity before filtering or copying rows for worker
+                    # divisibility. Repaired protocols remain invalid for training.
+                    metrics["training/invalid_action_rows"] = int((~rollout_valid_action_mask).sum())
+                    metrics["training/valid_action_rows"] = int(rollout_valid_action_mask.sum())
+                    metrics["episode/valid_action_ratio"] = (
+                        float(rollout_valid_action_mask.mean()) if len(batch) else 0.0
+                    )
                     unique_wg_ids = list(self.wg_to_agents_mapping.keys())
+                    training_batch = filter_valid_action_rows(batch)
+                    has_training_rows = training_batch is not None
+                    metrics["training/skipped_no_valid_actions"] = int(not has_training_rows)
+                    if has_training_rows:
+                        batch = training_batch
+                        # Only valid rows may be padded, balanced, scored or updated.
+                        multiagent_batch: Dict[str, DataProto] = split_batch_by_wg_ids(batch, unique_wg_ids)
 
-                    multiagent_batch: Dict[str, DataProto] = split_batch_by_wg_ids(batch, unique_wg_ids)
-
-                    for wg_id in multiagent_batch.keys():
-                        sub_batch = multiagent_batch[wg_id]
-                        
-                        # Create agent-specific config for adjust_batch
-                        agent_config = OmegaConf.create(OmegaConf.to_container(self.config, resolve=True))
-                        # Replace actor_rollout_ref with agent-specific config
-                        agent_config.actor_rollout_ref = self.wg_to_agents_mapping[wg_id][0]["config_actor_rollout_ref"]
-                        
-                        sub_batch = adjust_batch(agent_config, sub_batch, wg_id=wg_id)
-                        multiagent_batch[wg_id] = sub_batch
-                    
-                        sub_batch.batch["response_mask"] = compute_response_mask(sub_batch)
-                        # balance the number of valid tokens on each dp rank.
-                        # Note that this breaks the order of data inside the batch.
-                        # Please take care when you implement group based adv computation such as GRPO and rloo
-                        if self.config.trainer.balance_batch:
-                            self._balance_batch(sub_batch, wg_id, metrics=metrics, logging_prefix= f"global_seqlen/{wg_id}")
-
-                        # compute global_valid tokens
-                        sub_batch.meta_info[f"{wg_id}/global_token_num"] = torch.sum(sub_batch.batch["attention_mask"], dim=-1).tolist()
-
-                        multiagent_batch[wg_id] = sub_batch
-
-                    batch: DataProto = combine_batches(multiagent_batch)
-
-                    batch.meta_info[f"global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                    with _timer("reward", timing_raw):
-                        # compute reward model score
-                        if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(batch, self.config, self.tokenizers)
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-
-                    multiagent_batch: Dict[str, DataProto] = split_batch_by_wg_ids(batch, unique_wg_ids)
-                    # recompute old_log_probs
-                    with _timer("old_log_prob", timing_raw):
                         for wg_id in multiagent_batch.keys():
                             sub_batch = multiagent_batch[wg_id]
-                            assert all(wg_id == wg for wg in sub_batch.non_tensor_batch["wg_id"])
-                            old_log_prob = self.actor_rollout_wg[wg_id].compute_log_prob(sub_batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = sub_batch.batch["response_mask"]
-                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                            entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                            old_log_prob_metrics = {f"actor/{wg_id}/entropy_loss": entropy_loss.detach().item()}
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            sub_batch = sub_batch.union(old_log_prob)
-
-                            if "rollout_log_probs" in sub_batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                rollout_old_log_probs = sub_batch.batch["rollout_log_probs"]
-                                actor_old_log_probs = sub_batch.batch["old_log_probs"]
-                                attention_mask = sub_batch.batch["attention_mask"]
-                                responses = sub_batch.batch["responses"]
-                                response_length = responses.size(1)
-                                response_mask = attention_mask[:, -response_length:]
-
-                                rollout_probs = torch.exp(rollout_old_log_probs)
-                                actor_probs = torch.exp(actor_old_log_probs)
-                                rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
-                                rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
-                                rollout_probs_diff_max = torch.max(rollout_probs_diff)
-                                rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
-                                rollout_probs_diff_std = torch.std(rollout_probs_diff)
-                                metrics.update(
-                                    {
-                                        f"training/{wg_id}/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
-                                        f"training/{wg_id}/rollout_probs_diff_mean": rollout_probs_diff_mean.detach().item(),
-                                        f"training/{wg_id}/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
-                                    }
-                                )
+                        
+                            # Create agent-specific config for adjust_batch
+                            agent_config = OmegaConf.create(OmegaConf.to_container(self.config, resolve=True))
+                            # Replace actor_rollout_ref with agent-specific config
+                            agent_config.actor_rollout_ref = self.wg_to_agents_mapping[wg_id][0]["config_actor_rollout_ref"]
+                        
+                            sub_batch = adjust_batch(agent_config, sub_batch, wg_id=wg_id)
                             multiagent_batch[wg_id] = sub_batch
+                    
+                            sub_batch.batch["response_mask"] = compute_response_mask(sub_batch)
+                            # balance the number of valid tokens on each dp rank.
+                            # Note that this breaks the order of data inside the batch.
+                            # Please take care when you implement group based adv computation such as GRPO and rloo
+                            if self.config.trainer.balance_batch:
+                                self._balance_batch(sub_batch, wg_id, metrics=metrics, logging_prefix= f"global_seqlen/{wg_id}")
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with _timer("ref", timing_raw):
-                            for wg_id in multiagent_batch.keys():
-                                sub_batch = multiagent_batch[wg_id]
-                                assert all(wg_id == wg for wg in sub_batch.non_tensor_batch["wg_id"])
-                                if not self.ref_in_actor:
-                                    ref_log_prob = self.ref_policy_wg[wg_id].compute_ref_log_prob(sub_batch)
-                                else:
-                                    ref_log_prob = self.actor_rollout_wg[wg_id].compute_ref_log_prob(sub_batch)
-                                sub_batch = sub_batch.union(ref_log_prob)
+                            # compute global_valid tokens
+                            sub_batch.meta_info[f"{wg_id}/global_token_num"] = torch.sum(sub_batch.batch["attention_mask"], dim=-1).tolist()
 
-                                multiagent_batch[wg_id] = sub_batch
-
-                    batch: DataProto = combine_batches(multiagent_batch)
-                    # compute values
-                    if self.use_critic:
-                        with _timer("values", timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-
-                    with _timer("adv", timing_raw):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        print(f"{list(reward_extra_infos_dict.keys())=}")
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        # compute rewards. apply_invalid_action_penalty if available
-                        if self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', True):
-                            batch, invalid_metrics = apply_invalid_action_penalty(batch,
-                                                                                  invalid_action_penalty_coef=self.config.actor_rollout_ref.actor.invalid_action_penalty_coef,
-                                                                                  )
-                            metrics.update(invalid_metrics)
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["kl_penalty"] = torch.zeros_like(batch.batch["token_level_scores"])
-                            if "invalid_action_penalty" in batch.batch.keys():
-                                batch.batch["token_level_rewards"] = (
-                                    batch.batch["token_level_scores"] + batch.batch["invalid_action_penalty"]
-                                )
-                            else:
-                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # compute advantages, executed on the driver process
-
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
-                        group_by_agent_id = self.config.algorithm.get("group_by_agent_id", False) # 
-                        credit_mode = self.config.algorithm.get("credit_mode", "standard")
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            group_by_agent_id=group_by_agent_id,
-                            credit_mode=credit_mode,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            use_pf_ppo=self.config.algorithm.use_pf_ppo,
-                            pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
-                            pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
-                            step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
-                            gigpo_mode=self.config.algorithm.gigpo.mode,
-                            gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
-                            gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
-                        )
-
-                    # update critic
-                    if self.use_critic:
-                        with _timer("update_critic", timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        multiagent_batch: Dict[str, DataProto] = split_batch_by_wg_ids(batch, unique_wg_ids)
-                        # update actor
-                        with _timer("update_actor", timing_raw):
-                            for wg_id in multiagent_batch.keys():
-                                sub_batch = multiagent_batch[wg_id]
-                                assert all(wg_id == wg for wg in sub_batch.non_tensor_batch["wg_id"])
-                                sub_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                                actor_output = self.actor_rollout_wg[wg_id].update_actor(sub_batch)
-                                actor_output_metrics = reduce_metrics(actor_output.meta_info[f"{wg_id}/metrics"])
-                                metrics.update(actor_output_metrics)
-                                multiagent_batch[wg_id] = sub_batch
+                            multiagent_batch[wg_id] = sub_batch
 
                         batch: DataProto = combine_batches(multiagent_batch)
 
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        with _timer("dump_rollout_generations", timing_raw):
-                            print(batch.batch.keys())
-                            inputs, outputs = [], []
-                            multiagent_batch: Dict[str, DataProto] = split_batch_by_wg_ids(batch, unique_wg_ids)
+                        batch.meta_info[f"global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                        with _timer("reward", timing_raw):
+                            # compute reward model score
+                            if self.use_rm:
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(batch, self.config, self.tokenizers)
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+                        # Attach rewards before further splitting/reordering so scores
+                        # and auxiliary reward fields stay aligned with their rows.
+                        batch.batch["token_level_scores"] = reward_tensor
+                        if reward_extra_infos_dict:
+                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        if self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', True):
+                            batch, invalid_metrics = apply_invalid_action_penalty(
+                                batch,
+                                invalid_action_penalty_coef=self.config.actor_rollout_ref.actor.invalid_action_penalty_coef,
+                            )
+                            # Keep the validity ratio measured on the original rollout.
+                            invalid_metrics.pop("episode/valid_action_ratio", None)
+                            metrics.update(invalid_metrics)
+
+                        # recompute old_log_probs
+                        with _timer("old_log_prob", timing_raw):
                             for wg_id in multiagent_batch.keys():
                                 sub_batch = multiagent_batch[wg_id]
-                                sub_inputs = self.tokenizers[wg_id].batch_decode(sub_batch.batch["prompts"], skip_special_tokens=True)
-                                sub_outputs = self.tokenizers[wg_id].batch_decode(sub_batch.batch["responses"], skip_special_tokens=True)
-                                inputs += sub_inputs
-                                outputs += sub_outputs
-                                
+                                assert all(wg_id == wg for wg in sub_batch.non_tensor_batch["wg_id"])
+                                old_log_prob = self.actor_rollout_wg[wg_id].compute_log_prob(sub_batch)
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = sub_batch.batch["response_mask"]
+                                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                                entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                                old_log_prob_metrics = {f"actor/{wg_id}/entropy_loss": entropy_loss.detach().item()}
+                                metrics.update(old_log_prob_metrics)
+                                old_log_prob.batch.pop("entropys")
+                                sub_batch = sub_batch.union(old_log_prob)
+
+                                if "rollout_log_probs" in sub_batch.batch.keys():
+                                    # TODO: we may want to add diff of probs too.
+                                    rollout_old_log_probs = sub_batch.batch["rollout_log_probs"]
+                                    actor_old_log_probs = sub_batch.batch["old_log_probs"]
+                                    attention_mask = sub_batch.batch["attention_mask"]
+                                    responses = sub_batch.batch["responses"]
+                                    response_length = responses.size(1)
+                                    response_mask = attention_mask[:, -response_length:]
+
+                                    rollout_probs = torch.exp(rollout_old_log_probs)
+                                    actor_probs = torch.exp(actor_old_log_probs)
+                                    rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
+                                    rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
+                                    rollout_probs_diff_max = torch.max(rollout_probs_diff)
+                                    rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
+                                    rollout_probs_diff_std = torch.std(rollout_probs_diff)
+                                    metrics.update(
+                                        {
+                                            f"training/{wg_id}/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
+                                            f"training/{wg_id}/rollout_probs_diff_mean": rollout_probs_diff_mean.detach().item(),
+                                            f"training/{wg_id}/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
+                                        }
+                                    )
+                                multiagent_batch[wg_id] = sub_batch
+
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with _timer("ref", timing_raw):
+                                for wg_id in multiagent_batch.keys():
+                                    sub_batch = multiagent_batch[wg_id]
+                                    assert all(wg_id == wg for wg in sub_batch.non_tensor_batch["wg_id"])
+                                    if not self.ref_in_actor:
+                                        ref_log_prob = self.ref_policy_wg[wg_id].compute_ref_log_prob(sub_batch)
+                                    else:
+                                        ref_log_prob = self.actor_rollout_wg[wg_id].compute_ref_log_prob(sub_batch)
+                                    sub_batch = sub_batch.union(ref_log_prob)
+
+                                    multiagent_batch[wg_id] = sub_batch
+
+                        batch: DataProto = combine_batches(multiagent_batch)
+                        batch.meta_info["global_token_num"] = torch.sum(
+                            batch.batch["attention_mask"], dim=-1
+                        ).tolist()
+                        # compute values
+                        if self.use_critic:
+                            with _timer("values", timing_raw):
+                                values = self.critic_wg.compute_values(batch)
+                                batch = batch.union(values)
+
+                        with _timer("adv", timing_raw):
+                            # compute rewards. apply_kl_penalty if available
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["kl_penalty"] = torch.zeros_like(batch.batch["token_level_scores"])
+                                if "invalid_action_penalty" in batch.batch.keys():
+                                    batch.batch["token_level_rewards"] = (
+                                        batch.batch["token_level_scores"] + batch.batch["invalid_action_penalty"]
+                                    )
+                                else:
+                                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                            # compute advantages, executed on the driver process
+
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+                            group_by_agent_id = self.config.algorithm.get("group_by_agent_id", False) # 
+                            credit_mode = self.config.algorithm.get("credit_mode", "standard")
+
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                group_by_agent_id=group_by_agent_id,
+                                credit_mode=credit_mode,
+                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                                use_pf_ppo=self.config.algorithm.use_pf_ppo,
+                                pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
+                                pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
+                                step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
+                                gigpo_mode=self.config.algorithm.gigpo.mode,
+                                gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
+                                gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            )
+
+                        # update critic
+                        if self.use_critic:
+                            with _timer("update_critic", timing_raw):
+                                critic_output = self.critic_wg.update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            metrics.update(critic_output_metrics)
+
+                        # implement critic warmup
+                        if self.config.trainer.critic_warmup <= self.global_steps:
+                            multiagent_batch: Dict[str, DataProto] = split_batch_by_wg_ids(batch, unique_wg_ids)
+                            # update actor
+                            with _timer("update_actor", timing_raw):
+                                for wg_id in multiagent_batch.keys():
+                                    sub_batch = multiagent_batch[wg_id]
+                                    assert all(wg_id == wg for wg in sub_batch.non_tensor_batch["wg_id"])
+                                    sub_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                    actor_output = self.actor_rollout_wg[wg_id].update_actor(sub_batch)
+                                    actor_output_metrics = reduce_metrics(actor_output.meta_info[f"{wg_id}/metrics"])
+                                    metrics.update(actor_output_metrics)
+                                    multiagent_batch[wg_id] = sub_batch
+
                             batch: DataProto = combine_batches(multiagent_batch)
 
-                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                            self._dump_generations(
-                                inputs=inputs,
-                                outputs=outputs,
-                                scores=scores,
-                                reward_extra_infos_dict=reward_extra_infos_dict,
-                                dump_path=rollout_data_dir,
-                            )
+                        # Log rollout generations if enabled
+                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if rollout_data_dir:
+                            with _timer("dump_rollout_generations", timing_raw):
+                                print(batch.batch.keys())
+                                inputs, outputs = [], []
+                                multiagent_batch: Dict[str, DataProto] = split_batch_by_wg_ids(batch, unique_wg_ids)
+                                for wg_id in multiagent_batch.keys():
+                                    sub_batch = multiagent_batch[wg_id]
+                                    sub_inputs = self.tokenizers[wg_id].batch_decode(sub_batch.batch["prompts"], skip_special_tokens=True)
+                                    sub_outputs = self.tokenizers[wg_id].batch_decode(sub_batch.batch["responses"], skip_special_tokens=True)
+                                    inputs += sub_inputs
+                                    outputs += sub_outputs
+                                
+                                batch: DataProto = combine_batches(multiagent_batch)
+
+                                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                                self._dump_generations(
+                                    inputs=inputs,
+                                    outputs=outputs,
+                                    scores=scores,
+                                    reward_extra_infos_dict={
+                                        key: batch.non_tensor_batch[key].tolist() for key in reward_extra_infos_dict
+                                    },
+                                    dump_path=rollout_data_dir,
+                                )
+
+                    else:
+                        # Keep an empty training batch for benchmark counts. Validation,
+                        # checkpointing and step logging still follow their normal schedule.
+                        batch = batch.select_idxs(np.empty(0, dtype=np.int64))
+                        print(f"Skipping training at step {self.global_steps}: no valid rollout actions.")
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
@@ -1506,12 +1534,15 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
-                # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, unique_wg_ids=unique_wg_ids, group_n=self.config.env.rollout.n, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
-                n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                # Empty training batches have no advantage/value statistics. Still
+                # report wall time and complete the step so a bad rollout cannot stall fit().
+                if has_training_rows:
+                    metrics.update(compute_data_metrics(batch=batch, unique_wg_ids=unique_wg_ids, group_n=self.config.env.rollout.n, use_critic=self.use_critic))
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    n_gpus = self.resource_pool_manager.get_n_gpus()
+                    metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                else:
+                    metrics.update({f"timing_s/{name}": value for name, value in timing_raw.items()})
 
                 # TODO: make a canonical logger that supports various backend
                 if benchmark is not None:
