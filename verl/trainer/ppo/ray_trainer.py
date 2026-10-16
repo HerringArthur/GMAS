@@ -1295,7 +1295,7 @@ class RayPPOTrainer:
                     )
                     unique_wg_ids = list(self.wg_to_agents_mapping.keys())
                     training_batch = filter_valid_action_rows(batch)
-                    has_training_rows = training_batch is not None
+                    has_training_rows = training_batch is not None and len(training_batch) > 0
                     metrics["training/skipped_no_valid_actions"] = int(not has_training_rows)
                     if has_training_rows:
                         batch = training_batch
@@ -1304,15 +1304,15 @@ class RayPPOTrainer:
 
                         for wg_id in multiagent_batch.keys():
                             sub_batch = multiagent_batch[wg_id]
-                        
+
                             # Create agent-specific config for adjust_batch
                             agent_config = OmegaConf.create(OmegaConf.to_container(self.config, resolve=True))
                             # Replace actor_rollout_ref with agent-specific config
                             agent_config.actor_rollout_ref = self.wg_to_agents_mapping[wg_id][0]["config_actor_rollout_ref"]
-                        
+
                             sub_batch = adjust_batch(agent_config, sub_batch, wg_id=wg_id)
                             multiagent_batch[wg_id] = sub_batch
-                    
+
                             sub_batch.batch["response_mask"] = compute_response_mask(sub_batch)
                             # balance the number of valid tokens on each dp rank.
                             # Note that this breaks the order of data inside the batch.
@@ -1347,7 +1347,8 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        if self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', True):
+                        if (self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', True)
+                                and "is_action_valid" in batch.non_tensor_batch):
                             batch, invalid_metrics = apply_invalid_action_penalty(
                                 batch,
                                 invalid_action_penalty_coef=self.config.actor_rollout_ref.actor.invalid_action_penalty_coef,
@@ -1355,6 +1356,10 @@ class RayPPOTrainer:
                             # Keep the validity ratio measured on the original rollout.
                             invalid_metrics.pop("episode/valid_action_ratio", None)
                             metrics.update(invalid_metrics)
+
+                        # Carry the attached scores and reward metadata into every
+                        # worker batch without another padding/balancing pass.
+                        multiagent_batch = split_batch_by_wg_ids(batch, unique_wg_ids)
 
                         # recompute old_log_probs
                         with _timer("old_log_prob", timing_raw):
@@ -1437,7 +1442,7 @@ class RayPPOTrainer:
                             # compute advantages, executed on the driver process
 
                             norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
-                            group_by_agent_id = self.config.algorithm.get("group_by_agent_id", False) # 
+                            group_by_agent_id = self.config.algorithm.get("group_by_agent_id", False) #
                             credit_mode = self.config.algorithm.get("credit_mode", "standard")
 
                             batch = compute_advantage(
@@ -1495,7 +1500,7 @@ class RayPPOTrainer:
                                     sub_outputs = self.tokenizers[wg_id].batch_decode(sub_batch.batch["responses"], skip_special_tokens=True)
                                     inputs += sub_inputs
                                     outputs += sub_outputs
-                                
+
                                 batch: DataProto = combine_batches(multiagent_batch)
 
                                 scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()

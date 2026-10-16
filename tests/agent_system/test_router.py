@@ -147,9 +147,9 @@ class RouterTests(unittest.TestCase):
                 self.assertEqual(router.parse_response(response), expected)
         obs = {'text': ['task']}
         prompt = router.build_prompt(obs, ['shared work'], 2)['text'][0]
-        self.assertIn('- Sub Agent 1', prompt)
-        self.assertIn('- Sub Agent 2', prompt)
-        self.assertIn('- Sub Agent 3', prompt)
+        self.assertIn('- <route>Sub Agent 1</route>', prompt)
+        self.assertIn('- <route>Sub Agent 2</route>', prompt)
+        self.assertIn('- <route>Sub Agent 3</route>', prompt)
         self.assertIn('shared work', prompt)
         self.assertEqual(obs, {'text': ['task']})
 

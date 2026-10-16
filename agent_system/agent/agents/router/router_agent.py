@@ -109,23 +109,20 @@ class RouterAgent(BaseAgent):
         self.worker_ids = [name for name in config.agent.agent_ids if name != self.name]
         if not self.worker_ids or len(set(self.worker_ids)) != len(self.worker_ids):
             raise ValueError("Router Agent requires at least one worker with a unique name.")
-        if self.FINISH in self.worker_ids:
-            raise ValueError("FINISH is reserved for submitting the worker result.")
-
+        
     def reset(self):
         self.search_feedback = None
         self._context_token_cache = None
 
     def build_prompt(self, env_obs: Dict[str, Any], team_context: List[str], step: int,
                      agent_active_mask=None, collaboration_context=None) -> Dict[str, Any]:
+        available_agents = "\n# Valid Routing Outputs\n" + "\n".join(
+            f"- <route>{name}</route>" for name in self.worker_ids
+        ) + "\n- <route>FINISH</route>\n\nChoose exactly one routing output."
         if 'search' in self.config.env.env_name.lower():
-            available_agents = "\n# Valid Routing Outputs\n" + "\n".join(
-                f"- <route>{name}</route>" for name in self.worker_ids
-            ) + "\n- <route>FINISH</route>\n\nChoose exactly one routing output."
             return build_search_observation(self, env_obs, team_context, step, self.prompt, available_agents,
                                             agent_active_mask=agent_active_mask,
                                             collaboration_context=collaboration_context)
-        available_agents = "\n# Available Agents\n" + "\n".join(f"- {name}" for name in self.worker_ids)
         return build_context_observation(self, env_obs, team_context, step, self.prompt, available_agents,
                                          agent_active_mask=agent_active_mask,
                                          collaboration_context=collaboration_context)
