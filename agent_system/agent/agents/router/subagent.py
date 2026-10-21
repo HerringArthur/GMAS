@@ -83,7 +83,8 @@ Assess what the evidence establishes and what work remains.
   Use either control tag to return to the Router after the search; the Router
   decides whether to reselect a worker or finish.
 - As soon as the evidence and reasoning support a complete answer, output
-  <answer>final answer</answer> outside <think>, followed by HANDOFF. Answer the
+  <answer>final answer</answer> outside <think>, followed by HANDOFF. Every answer
+  requires HANDOFF on every step; CONTINUE after an answer is invalid. Answer the
   original question concisely and completely. Put explanations in <think>.
 
 Use at most one search or answer block per response. Do not output both. A claim
@@ -326,6 +327,9 @@ class SubAgent(BaseAgent):
                              '<handoff>HANDOFF</handoff> outside <think>. Nothing may follow it.')
                 else:
                     action, is_search, error = self.search_action(text_responses[i])
+                    if not error and action and not is_search and decisions[i] != 'HANDOFF':
+                        error = ('An <answer> must be followed by <handoff>HANDOFF</handoff> '
+                                 'on every step. CONTINUE after an answer is invalid.')
                     if final_step and not error and (not action or is_search or decisions[i] != 'HANDOFF'):
                         error = 'This response does not satisfy the final-step answer requirement.'
                 if error and final_step:

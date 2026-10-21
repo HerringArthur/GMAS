@@ -70,7 +70,6 @@ from agent_system.multi_turn_rollout import (
     split_batch_by_wg_ids,
     combine_batches,
     get_valid_action_mask,
-    filter_valid_action_rows,
 )
 from agent_system.agent.utils import build_wg_ids, normalize_agent_id, normalize_model_id
 
@@ -1286,20 +1285,18 @@ class RayPPOTrainer:
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
                     
-                    # Record validity before filtering or copying rows for worker
-                    # divisibility. Repaired protocols remain invalid for training.
+                    # Record validity before copying rows for worker divisibility.
+                    # Invalid and protocol-repaired responses stay in training
+                    # so the configured invalid-action penalty can update them.
                     metrics["training/invalid_action_rows"] = int((~rollout_valid_action_mask).sum())
                     metrics["training/valid_action_rows"] = int(rollout_valid_action_mask.sum())
                     metrics["episode/valid_action_ratio"] = (
                         float(rollout_valid_action_mask.mean()) if len(batch) else 0.0
                     )
                     unique_wg_ids = list(self.wg_to_agents_mapping.keys())
-                    training_batch = filter_valid_action_rows(batch)
-                    has_training_rows = training_batch is not None and len(training_batch) > 0
-                    metrics["training/skipped_no_valid_actions"] = int(not has_training_rows)
+                    has_training_rows = len(batch) > 0
+                    metrics["training/skipped_empty_rollout"] = int(not has_training_rows)
                     if has_training_rows:
-                        batch = training_batch
-                        # Only valid rows may be padded, balanced, scored or updated.
                         multiagent_batch: Dict[str, DataProto] = split_batch_by_wg_ids(batch, unique_wg_ids)
 
                         for wg_id in multiagent_batch.keys():
@@ -1517,8 +1514,7 @@ class RayPPOTrainer:
                     else:
                         # Keep an empty training batch for benchmark counts. Validation,
                         # checkpointing and step logging still follow their normal schedule.
-                        batch = batch.select_idxs(np.empty(0, dtype=np.int64))
-                        print(f"Skipping training at step {self.global_steps}: no valid rollout actions.")
+                        print(f"Skipping training at step {self.global_steps}: empty rollout.")
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):

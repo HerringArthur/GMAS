@@ -164,13 +164,10 @@ class TrainingBenchmark:
         training_counts = Counter(str(wg) for wg in training_batch.non_tensor_batch["wg_id"])
         for wg, count in training_counts.items():
             metrics[f"benchmark/training_rows/{wg}"] = count
-            source_count = metrics.get(
-                f"benchmark/valid_rollout_rows/{wg}",
-                metrics[f"benchmark/rollout_rows/{wg}"],
-            )
+            source_count = metrics[f"benchmark/rollout_rows/{wg}"]
             metrics[f"benchmark/copied_rows/{wg}"] = count - source_count
         metrics["benchmark/training_rows"] = len(training_batch)
-        source_rows = metrics.get("benchmark/valid_rollout_rows", metrics["benchmark/rollout_rows"])
+        source_rows = metrics["benchmark/rollout_rows"]
         metrics["benchmark/copied_rows"] = len(training_batch) - source_rows
         metrics["benchmark/step_excluding_samples_s"] = step_s - dump_s
         metrics["benchmark/questions_per_s"] = metrics["benchmark/questions"] / step_s
