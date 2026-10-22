@@ -12,6 +12,7 @@ agent:
   orchestra:
     router:
       max_loop_num: 4
+      max_context_runs: 2 # Retained completed runs per sample, across environment steps.
 
 env:
   env_name: math

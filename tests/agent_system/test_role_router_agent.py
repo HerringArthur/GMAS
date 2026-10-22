@@ -333,7 +333,9 @@ class RoleSubAgentTests(unittest.TestCase):
                                 ("search", ["SEARCH", "VERIFY", "ANSWER"])):
             with self.subTest(env_name=env_name):
                 config = SimpleNamespace(
-                    agent=SimpleNamespace(role_ids=roles), env=SimpleNamespace(env_name=env_name),
+                    agent=SimpleNamespace(role_ids=roles, orchestra=SimpleNamespace(
+                        router=SimpleNamespace(max_context_runs=1))),
+                    env=SimpleNamespace(env_name=env_name),
                 )
                 names = ["Router Agent", *roles]
                 mapping = {name: f"policy:{name}" for name in names}
@@ -350,10 +352,11 @@ class RoleSubAgentTests(unittest.TestCase):
                     "Router Agent": deque([
                         [instruction, "<route>VERIFY</route>"],
                         [f"<route>{roles[2]}</route>", "<route>FINISH</route>"],
+                        ["<route>VERIFY</route>", f"<route>{roles[0]}</route>"],
                         ["<route>FINISH</route>", f"<route>{roles[0]}</route>"],
                     ]),
                     roles[0]: deque([[first_output, "ignored"]]),
-                    "VERIFY": deque([["ignored", "review"]]),
+                    "VERIFY": deque([["ignored", "review"], ["final review", "ignored"]]),
                     roles[2]: deque([["final output", "ignored"]]),
                 }
                 prompts = []
@@ -378,7 +381,7 @@ class RoleSubAgentTests(unittest.TestCase):
                     inputs = (SimpleNamespace(meta_info={}), {"text": ["A task", "B task"]}, groups, np.ones(2, dtype=bool), 1)
                     actions, buffer = orchestra.run(*inputs)
                     self.assertEqual(actions, [first_output, ""])
-                    self.assertIn("review", orchestra.team_context[1])
+                    self.assertIn("review", "".join(orchestra.team_context[1]))
                     self.assertIn(f"You are {roles[0]}.", prompts[1][0])
                     self.assertIn(instruction, prompts[1][0])
                     self.assertIn("You are VERIFY.", prompts[2][1])
@@ -399,6 +402,7 @@ class RoleSubAgentTests(unittest.TestCase):
                         inputs = (inputs[0], next_obs, groups, np.array([True, False]), 2)
                         scripts["Router Agent"] = deque([
                             ["<route>ANSWER</route>", "<route>FINISH</route>"],
+                            ["<route>VERIFY</route>", "<route>SEARCH</route>"],
                             ["<route>FINISH</route>", "<route>SEARCH</route>"],
                         ])
                         other_action, other_reason = "", ""
@@ -411,9 +415,12 @@ class RoleSubAgentTests(unittest.TestCase):
                     self.assertIn(instruction, prompts[prompt_start][0])
                     self.assertIn(f"You are {roles[2]}.", prompts[prompt_start + 1][0])
                     self.assertIn(first_output, prompts[prompt_start + 1][0])
-                    # A saved candidate must remain visible even if its original
-                    # history entry is no longer part of the prompt.
-                    orchestra.team_context = ["", ""]
+                    # The review evicts the answer's original run. The next
+                    # Router must still see it through the candidate section.
+                    actions, _ = orchestra.run(*inputs)
+                    self.assertEqual(actions, ["final output", other_action])
+                    self.assertNotIn("final output", "".join(orchestra.team_context[0]))
+                    self.assertIn("final review", "".join(orchestra.team_context[0]))
                     prompt_start = len(prompts)
                     actions, _ = orchestra.run(*inputs)
                     self.assertEqual(actions, ["final output", other_action])

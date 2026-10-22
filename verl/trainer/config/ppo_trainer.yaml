@@ -319,6 +319,7 @@ agent: # only for multi-agent training
       max_loop_num: 3
     router:
       max_loop_num: 4 # Per environment step: at most one worker turn per sample per loop
+      max_context_runs: 2 # Retained completed runs per sample, across environment steps.
 
 env:
   env_name: alfworld/AlfredTWEnv

@@ -45,6 +45,7 @@ Example configuration, alongside a matching agent-to-worker-group mapping::
       orchestra:
         router:
           max_loop_num: 4
+          max_context_runs: 2
 
 Role prompts belong to the agents. Further role-output validation and
 credit-assignment metadata are deferred.
@@ -63,21 +64,28 @@ from agent_system.agent.orchestra.base import BaseOrchestra
 
 def update_team_context(
     agent_id: str,
-    team_context: List[str],
+    team_context: List[List[str]],
     text_response: List[str],
     agent_active_mask: Optional[np.ndarray] = None,
-) -> List[str]:
-    """Append full Router or role outputs to each selected sample's history.
+    *,
+    step: int,
+    max_context_runs: int,
+) -> List[List[str]]:
+    """Keep the latest runs directly in each sample's team context.
 
-    The caller selects active, valid responses with the mask. Existing history
-    is retained; reset() controls when a new rollout starts with empty context.
+    Router starts a run; its selected role appends to the same entry. Invalid
+    Router responses are passed as empty strings so attempts still count.
     """
     if agent_active_mask is None:
         agent_active_mask = np.ones(len(team_context), dtype=bool)
 
     for i in range(len(team_context)):
         if agent_active_mask[i]:
-            team_context[i] += f'\nThe output of "{agent_id}": {text_response[i]}\n'
+            if agent_id == "Router Agent":
+                team_context[i].append(f'\n[Environment step {step}]\n' if text_response[i] else "")
+            if text_response[i]:
+                team_context[i][-1] += f'\nThe output of "{agent_id}": {text_response[i]}\n'
+            team_context[i] = team_context[i][-max_context_runs:]
     return team_context
 
 
@@ -104,9 +112,10 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
     """Let each active sample choose its next role independently.
 
     Each run() performs one Router call and at most one role call per sample.
-    The rollout collector repeats run() and owns the round budget. Team context
-    and candidate answers persist across environment steps until reset() starts
-    a new rollout.
+    The rollout collector repeats run() and owns the round budget. Each sample
+    retains its latest max_context_runs completed runs across environment steps.
+    During a run, the selected role also sees the current Router assignment.
+    Candidate answers persist independently until reset() starts a new rollout.
     initialize_context() clears pending actions and return reasons for each
     environment step. FINISH and valid SEARCH responses mark samples ready for
     the next environment interaction.
@@ -135,6 +144,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             config=config,
         )
         self.role_ids = role_ids
+        self.max_context_runs = config.agent.orchestra.router.max_context_runs
         self.team_context = None
         self.text_actions = None
         self.candidate_answers = None
@@ -149,14 +159,14 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
 
     def initialize_context(self, env_obs):
         """Start an environment step, retaining team context and candidate answers."""
-        text_actions, team_context, env_obs = super().initialize_context(env_obs)
+        text_actions, _, env_obs = super().initialize_context(env_obs)
         if self.team_context is None:
-            self.team_context = team_context
+            self.team_context = [[] for _ in text_actions]
         if self.candidate_answers is None:
             self.candidate_answers = [""] * len(text_actions)
         self.text_actions = text_actions
         self.return_reasons = np.full(len(self.text_actions), "", dtype=object)
-        return self.text_actions, self.team_context, env_obs
+        return self.text_actions, ["".join(runs) for runs in self.team_context], env_obs
 
     def run(
         self,
@@ -174,11 +184,12 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             return self.text_actions.copy(), self.multiagent_batch_buffer
 
         # 1. Route each pending sample once, using work from preceding calls.
+        prompt_context = ["".join(runs) for runs in self.team_context]
         actor_rollout_wg = actor_rollout_wgs[self.agents_to_wg_mapping[self.ROUTER_AGENT]]
         router_batch, router_responses = self.agents[self.ROUTER_AGENT].call(
             gen_batch=gen_batch,
             env_obs=env_obs,
-            team_context=self.team_context,
+            team_context=prompt_context,
             candidate_answers=self.candidate_answers,
             actor_rollout_wg=actor_rollout_wg,
             agent_active_mask=pending_mask,
@@ -187,7 +198,17 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         selections = router_batch.non_tensor_batch["selected_role"]
         finish_mask = selections == self.FINISH
         route_mask = pending_mask & router_batch.non_tensor_batch["is_action_valid"]
-        self.team_context = update_team_context(self.ROUTER_AGENT, self.team_context, router_responses, route_mask)
+        self.team_context = update_team_context(
+            self.ROUTER_AGENT, self.team_context,
+            np.where(route_mask, router_responses, "").tolist(),
+            agent_active_mask=pending_mask, step=step, max_context_runs=self.max_context_runs,
+        )
+        # The role sees the same prior runs as the Router plus its new assignment,
+        # even though stored context has already evicted the oldest run.
+        prompt_context = [
+            context + self.team_context[i][-1] if pending_mask[i] else context
+            for i, context in enumerate(prompt_context)
+        ]
         self.save_to_buffer(self.ROUTER_AGENT, router_batch)
         submit_mask = route_mask & finish_mask
         self.text_actions = update_text_action(self.text_actions, self.candidate_answers, submit_mask)
@@ -204,14 +225,17 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             batch, responses = self.agents[role].call(
                 gen_batch=gen_batch,
                 env_obs=env_obs,
-                team_context=self.team_context,
+                team_context=prompt_context,
                 candidate_answers=self.candidate_answers,
                 actor_rollout_wg=actor_rollout_wg,
                 agent_active_mask=role_mask,
                 step=step,
             )
             valid_mask = role_mask & batch.non_tensor_batch["is_action_valid"]
-            self.team_context = update_team_context(role, self.team_context, responses, valid_mask)
+            self.team_context = update_team_context(
+                role, self.team_context, responses, valid_mask,
+                step=step, max_context_runs=self.max_context_runs,
+            )
             update_answer = (
                 scene == "math" and role in ("SOLVE", "REVISE")
             ) or (

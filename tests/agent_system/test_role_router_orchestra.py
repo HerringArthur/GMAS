@@ -147,11 +147,11 @@ class ScriptedEnvironment:
 
 
 class RoleRouterTests(unittest.TestCase):
-    def make_orchestra(self, loops=4, roles=("SOLVE", "VERIFY", "REVISE"), env_name="math"):
+    def make_orchestra(self, loops=4, roles=("SOLVE", "VERIFY", "REVISE"), env_name="math", context_runs=2):
         names = ["Router Agent", *roles]
         self.config = SimpleNamespace(
             agent=SimpleNamespace(orchestra_type="router", orchestra=SimpleNamespace(
-                router=SimpleNamespace(max_loop_num=loops))),
+                router=SimpleNamespace(max_loop_num=loops, max_context_runs=context_runs))),
             env=SimpleNamespace(env_name=env_name, max_steps=2),
         )
         mapping = {name: f"policy:{name}" for name in names}
@@ -242,8 +242,97 @@ class RoleRouterTests(unittest.TestCase):
         self.assertEqual(solver_calls[0]["agent_active_mask"].tolist(), [True, False, False])
         self.assertEqual(solver_calls[1]["agent_active_mask"].tolist(), [False, True, False])
         self.assertIs(solver_calls[0]["actor_rollout_wg"], solver_calls[1]["actor_rollout_wg"])
-        self.assertEqual(orchestra.team_context[2], "")
-        self.assertNotIn("must ignore", "".join(orchestra.team_context))
+        self.assertEqual(orchestra.team_context[2], [])
+        self.assertNotIn("must ignore", "".join("".join(runs) for runs in orchestra.team_context))
+
+    def test_context_window_keeps_complete_runs_and_candidate_independently(self):
+        for window in (1, 2, 3):
+            with self.subTest(window=window):
+                orchestra = self.make_orchestra(loops=8, context_runs=window)
+                for turn in range(1, 6):
+                    role = "SOLVE" if turn == 1 else "VERIFY"
+                    decision = f"Decision for run {turn}."
+                    response = f"Output for run {turn}."
+                    orchestra.agents["Router Agent"].enqueue([decision], [role])
+                    self.respond(role, [response])
+                    _, buffer = self.run_round(step=1)
+                    if turn == 1:
+                        first_buffer = buffer
+
+                    router_context = orchestra.agents["Router Agent"].calls[-1]["team_context"][0]
+                    role_context = orchestra.agents[role].calls[-1]["team_context"][0]
+                    self.assertIn(decision, role_context)
+                    for previous in range(1, turn):
+                        old_decision = f"Decision for run {previous}."
+                        old_response = f"Output for run {previous}."
+                        for context in (router_context, role_context):
+                            if previous >= turn - window:
+                                self.assertIn(old_decision, context)
+                                self.assertIn(old_response, context)
+                            else:
+                                self.assertNotIn(old_decision, context)
+                                self.assertNotIn(old_response, context)
+
+                    self.assertEqual(len(orchestra.team_context[0]), min(turn, window))
+                    for previous in range(1, turn + 1):
+                        for text in (f"Decision for run {previous}.", f"Output for run {previous}."):
+                            if previous >= turn - window + 1:
+                                self.assertIn(text, "".join(orchestra.team_context[0]))
+                            else:
+                                self.assertNotIn(text, "".join(orchestra.team_context[0]))
+
+                self.assertEqual(orchestra.candidate_answers, ["Output for run 1."])
+                self.assertEqual(orchestra.agents["VERIFY"].calls[-1]["candidate_answers"], ["Output for run 1."])
+                self.assertNotIn("Output for run 1.", "".join(orchestra.team_context[0]))
+                self.assertEqual(first_buffer[1]["batch"].batch["responses"], ("Output for run 1.",))
+
+    def test_context_window_does_not_age_paused_or_inactive_samples(self):
+        orchestra = self.make_orchestra(roles=("SEARCH", "VERIFY"), env_name="search")
+        query = "<search>paused sample query</search>"
+        self.route(["SEARCH", "VERIFY", "VERIFY"])
+        self.respond("SEARCH", [query, "ignored", "inactive"])
+        self.respond("VERIFY", ["ignored", "Review 1.", "inactive"])
+        self.run_round(active=(True, True, False))
+        paused_context = orchestra.team_context[0].copy()
+
+        for turn in range(2, 6):
+            self.route(["VERIFY", "VERIFY", "VERIFY"])
+            self.respond("VERIFY", ["must ignore", f"Review {turn}.", "inactive"])
+            self.run_round(active=(True, True, False))
+            self.assertEqual(orchestra.team_context[0], paused_context)
+            self.assertEqual(orchestra.team_context[2], [])
+        self.assertEqual(len(orchestra.team_context[1]), 2)
+        self.assertIn("Review 4.", "".join(orchestra.team_context[1]))
+        self.assertIn("Review 5.", "".join(orchestra.team_context[1]))
+        self.assertNotIn("Review 3.", "".join(orchestra.team_context[1]))
+
+        orchestra.initialize_context({"text": ["Evidence A", "Evidence B", "Inactive"]})
+        self.route(["VERIFY", "FINISH", "VERIFY"])
+        self.respond("VERIFY", ["Review after retrieval.", "ignored", "inactive"])
+        self.run_round(active=(True, True, False), step=2)
+        self.assertEqual(orchestra.agents["Router Agent"].calls[-1]["team_context"][0], "".join(paused_context))
+        self.assertIn(query, "".join(orchestra.team_context[0]))
+        self.assertIn("Review after retrieval.", "".join(orchestra.team_context[0]))
+        self.assertEqual(len(orchestra.team_context[0]), 2)
+        self.assertIn("[Environment step 1]", orchestra.team_context[0][0])
+        self.assertIn("[Environment step 2]", orchestra.team_context[0][1])
+
+    def test_invalid_runs_count_toward_window_without_recording_invalid_text(self):
+        orchestra = self.make_orchestra()
+        self.route(["SOLVE"])
+        self.respond("SOLVE", ["Saved candidate"])
+        self.run_round()
+        for _ in range(2):
+            invalid_batch = self.route(["UNKNOWN"], valid=[False])
+            self.run_round()
+            self.assertFalse(invalid_batch.non_tensor_batch["is_action_valid"][0])
+        self.assertEqual(orchestra.team_context, [["", ""]])
+        self.assertEqual(orchestra.candidate_answers, ["Saved candidate"])
+        self.route(["FINISH"])
+        self.assertEqual(self.run_round()[0], ["Saved candidate"])
+        router_call = orchestra.agents["Router Agent"].calls[-1]
+        self.assertEqual(router_call["team_context"], [""])
+        self.assertEqual(router_call["candidate_answers"], ["Saved candidate"])
 
     def test_invalid_outputs_wait_for_next_router_call_and_preserve_answer(self):
         orchestra = self.make_orchestra()
@@ -274,14 +363,15 @@ class RoleRouterTests(unittest.TestCase):
         self.run_round()
         orchestra.reset()
         self.assertIsNone(orchestra.candidate_answers)
+        self.assertIsNone(orchestra.team_context)
         self.route(["VERIFY"])
         self.respond("VERIFY", ["new report"])
         self.assertEqual(self.run_round()[0], [""])
         self.assertEqual(orchestra.candidate_answers, [""])
         self.assertEqual(orchestra.agents["Router Agent"].calls[-1]["candidate_answers"], [""])
         self.assertEqual(orchestra.agents["VERIFY"].calls[-1]["candidate_answers"], [""])
-        self.assertIn("new report", orchestra.team_context[0])
-        self.assertNotIn("old answer", orchestra.team_context[0])
+        self.assertIn("new report", "".join(orchestra.team_context[0]))
+        self.assertNotIn("old answer", "".join(orchestra.team_context[0]))
         self.assertEqual(orchestra.return_reasons.tolist(), [""])
         self.assertTrue(all(agent.reset_count == 1 for agent in orchestra.agents.values()))
 
@@ -289,6 +379,7 @@ class RoleRouterTests(unittest.TestCase):
         orchestra = self.make_orchestra()
         self.assertEqual(self.run_round(active=(False, False)), (["", ""], []))
         self.assertTrue(all(not agent.calls for agent in orchestra.agents.values()))
+        self.assertEqual(orchestra.team_context, [[], []])
 
     def test_environment_step_preserves_work_and_resets_pending_actions(self):
         orchestra = self.make_orchestra(roles=("ANSWER", "VERIFY", "SEARCH"), env_name="search")
@@ -300,7 +391,8 @@ class RoleRouterTests(unittest.TestCase):
             self.route([role])
             self.respond(role, [response])
             self.run_round()
-        previous_context = orchestra.team_context.copy()
+        previous_context = ["".join(runs) for runs in orchestra.team_context]
+        self.assertNotIn("Candidate answer", previous_context[0])
         self.assertEqual(orchestra.agents["SEARCH"].calls[-1]["candidate_answers"], ["Candidate answer"])
         self.assertEqual(orchestra.candidate_answers, ["Candidate answer"])
         self.assertEqual(orchestra.text_actions, ["<search>supporting evidence</search>"])
@@ -322,8 +414,11 @@ class RoleRouterTests(unittest.TestCase):
         self.assertEqual(router_call["candidate_answers"], ["Candidate answer"])
         self.assertEqual(orchestra.agents["VERIFY"].calls[-1]["candidate_answers"], ["Candidate answer"])
         self.assertEqual(router_call["env_obs"], next_obs)
-        self.assertTrue(orchestra.team_context[0].startswith(previous_context[0]))
-        self.assertIn("The new evidence supports the candidate", orchestra.team_context[0])
+        self.assertNotIn("The candidate needs supporting evidence", "".join(orchestra.team_context[0]))
+        self.assertIn("<search>supporting evidence</search>", "".join(orchestra.team_context[0]))
+        self.assertIn("[Environment step 1]", "".join(orchestra.team_context[0]))
+        self.assertIn("[Environment step 2]", "".join(orchestra.team_context[0]))
+        self.assertIn("The new evidence supports the candidate", "".join(orchestra.team_context[0]))
         self.route(["FINISH"])
         self.assertEqual(self.run_round(step=2, observation=next_obs["text"])[0], ["Candidate answer"])
 
@@ -374,7 +469,7 @@ class RoleRouterTests(unittest.TestCase):
         self.assertIn("B answer", calls[2]["team_context"][1])
         self.assertNotIn("B answer", calls[2]["team_context"][0])
         self.assertNotIn(query, calls[2]["team_context"][1])
-        self.assertEqual(orchestra.team_context[1], calls[2]["team_context"][1])
+        self.assertEqual("".join(orchestra.team_context[1]), calls[2]["team_context"][1])
         self.assertIn("retrieved evidence", calls[2]["env_obs"]["text"][0])
         self.assertEqual(lengths.tolist(), [2.0, 1.0])
         self.assertEqual(rewards.tolist(), [1.0, 1.0])
@@ -388,7 +483,7 @@ class RoleRouterTests(unittest.TestCase):
         actions, _ = self.run_round(active=(True, True, False))
         self.assertEqual(actions, [query, "", ""])
         self.assertEqual(orchestra.return_reasons.tolist(), ["search", "", ""])
-        self.assertNotIn("broken request", orchestra.team_context[1])
+        self.assertNotIn("broken request", "".join(orchestra.team_context[1]))
 
         self.route(["SEARCH"] * 3)
         second_query = "<search>second query</search>"
@@ -448,7 +543,7 @@ class RoleRouterTests(unittest.TestCase):
         self.assertEqual([row["agent_id"] for row in rows[1]].count("ANSWER"), 2)
         self.assertEqual(orchestra.agents["ANSWER"].calls[-1]["agent_active_mask"].tolist(), [False, True])
         self.assertEqual([sample[-1]["return_reason"] for sample in rows], ["finish", "finish"])
-        self.assertNotIn("must ignore", orchestra.team_context[0])
+        self.assertNotIn("must ignore", "".join(orchestra.team_context[0]))
 
     def test_budget_fallback_uses_prior_candidate_and_preserves_search_and_finish_actions(self):
         orchestra = self.make_orchestra(loops=2, roles=("SEARCH", "VERIFY", "ANSWER"), env_name="search")
@@ -475,7 +570,7 @@ class RoleRouterTests(unittest.TestCase):
         self.assertEqual([sample[-1]["return_reason"] for sample in rows], ["finish", "search", "loop_limit"])
         self.assertEqual(orchestra.agents["ANSWER"].calls[-1]["agent_active_mask"].tolist(), [False, False, True])
         self.assertFalse(rows[2][-1]["is_action_valid"])
-        self.assertNotIn("invalid answer", orchestra.team_context[2])
+        self.assertNotIn("invalid answer", "".join(orchestra.team_context[2]))
 
     def test_collector_invalid_routes_are_bounded_without_a_candidate(self):
         self.make_orchestra(loops=2)
@@ -522,7 +617,7 @@ class RoleRouterTests(unittest.TestCase):
         self.respond("SOLVE", ["A answer", "B answer", "C answer"])
         self.assertEqual(self.run_round(active=(True, True, True))[0], ["A answer", "B answer", "C answer"])
         self.assertEqual(orchestra.return_reasons.tolist(), ["", "", ""])
-        self.assertIn("A answer", orchestra.team_context[0])
+        self.assertIn("A answer", "".join(orchestra.team_context[0]))
 
         self.route(["SOLVE", "SOLVE", "FINISH"])
         self.respond("SOLVE", ["A revised", "B revised", "ignored"])
@@ -541,8 +636,8 @@ class RoleRouterTests(unittest.TestCase):
             "SOLVE", ["valid answer", "invalid answer"], valid=[True, False],
         )
         self.assertEqual(self.run_round(active=(True, True))[0], ["valid answer", ""])
-        self.assertIn("valid answer", orchestra.team_context[0])
-        self.assertNotIn("invalid answer", orchestra.team_context[1])
+        self.assertIn("valid answer", "".join(orchestra.team_context[0]))
+        self.assertNotIn("invalid answer", "".join(orchestra.team_context[1]))
         self.assertEqual(orchestra.return_reasons.tolist(), ["", ""])
         self.route(["FINISH", "FINISH"])
         actions, buffer = self.run_round(active=(True, True))
@@ -568,8 +663,12 @@ class RoleRouterTests(unittest.TestCase):
                 self.assertEqual(env.actions, [["candidate answer"]])
                 self.assertEqual(orchestra.return_reasons.tolist(), ["finish"])
                 final_context = orchestra.agents["Router Agent"].calls[-1]["team_context"][0]
-                for role in ("VERIFY", "PLANNER", other_scene_role):
+                self.assertNotIn("feedback from VERIFY", final_context)
+                self.assertNotIn("candidate answer", final_context)
+                self.assertEqual(orchestra.agents["Router Agent"].calls[-1]["candidate_answers"], ["candidate answer"])
+                for role in ("PLANNER", other_scene_role):
                     self.assertIn(f"feedback from {role}", final_context)
+                for role in ("VERIFY", "PLANNER", other_scene_role):
                     self.assertEqual(sum(row["agent_id"] == role for row in rows[0]), 1)
 
 
