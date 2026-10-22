@@ -252,6 +252,42 @@ class RoleSubAgentTests(unittest.TestCase):
         self.assertEqual(batch.non_tensor_batch["selected_role"].tolist(), [""] * 4)
         self.assertEqual(batch.non_tensor_batch["env_step"].tolist(), [1] * 4)
 
+    def test_search_requires_one_nonempty_request_and_preserves_generated_text(self):
+        agent = AgentRegistry.create(
+            "SEARCH", wg_id="search-policy", tokenizer=None, processor=None,
+            config=SimpleNamespace(env=SimpleNamespace(env_name="search")),
+        )
+        responses = [
+            "<search>first query</search>",
+            " \n<think>Find supporting evidence.</think>\n<search> second query </search>\n",
+            "",
+            "plain text without a search request",
+            "<search></search>",
+            "<search> \n </search>",
+            "<search>unfinished",
+            "<search>first</search><search>second</search>",
+            "<search>query</search> extra",
+            "<answer>final answer</answer>",
+            "<think><search>quoted query</search></think><search>actual query</search>",
+            "<think><answer>premature answer</answer></think><search>query</search>",
+            "<search><search>nested</search></search>",
+            "<search>inactive query</search>",
+        ]
+        size = len(responses)
+        mask = np.array([True] * (size - 1) + [False])
+        raw_tokens = object()
+        batch = SimpleNamespace(batch={"responses": raw_tokens}, non_tensor_batch={})
+        with patch.object(subagent_module, "preprocess_batch", return_value=batch):
+            with patch.object(agent, "_generate_with_llm", return_value=(batch, responses)):
+                returned_batch, returned_responses = agent.call(
+                    SimpleNamespace(meta_info={}), {"text": ["Question"] * size},
+                    [""] * size, object(), mask, step=1,
+                )
+        self.assertIs(returned_batch, batch)
+        self.assertIs(returned_responses, responses)
+        self.assertIs(batch.batch["responses"], raw_tokens)
+        self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(), [True, True] + [False] * (size - 2))
+
     def test_orchestra_dispatches_real_agents_with_role_prompts_and_model_groups(self):
         for env_name, roles in (("math", ["SOLVE", "VERIFY", "REVISE"]),
                                 ("search", ["SEARCH", "VERIFY", "ANSWER"])):
@@ -269,13 +305,14 @@ class RoleSubAgentTests(unittest.TestCase):
                     )
                 self.assertEqual(list(orchestra.agents), names)
                 instruction = f"<think>Perform the assigned task.</think><route>{roles[0]}</route>"
+                first_output = "<search>first query</search>" if env_name == "search" else "first output"
                 scripts = {
                     "Router Agent": deque([
                         [instruction, "<route>VERIFY</route>"],
                         [f"<route>{roles[2]}</route>", "<route>FINISH</route>"],
                         ["<route>FINISH</route>", f"<route>{roles[0]}</route>"],
                     ]),
-                    roles[0]: deque([["first output", "ignored"]]),
+                    roles[0]: deque([[first_output, "ignored"]]),
                     "VERIFY": deque([["ignored", "review"]]),
                     roles[2]: deque([["final output", "ignored"]]),
                 }
@@ -300,7 +337,8 @@ class RoleSubAgentTests(unittest.TestCase):
                         stack.enter_context(patch.object(agent, "_generate_with_llm", side_effect=partial(generate, name)))
                     inputs = (SimpleNamespace(meta_info={}), {"text": ["A task", "B task"]}, groups, np.ones(2, dtype=bool), 1)
                     actions, buffer = orchestra.run(*inputs)
-                    self.assertEqual(actions, ["first output", "review"])
+                    self.assertEqual(actions, [first_output, ""])
+                    self.assertIn("review", orchestra.team_context[1])
                     self.assertIn(f"You are {roles[0]}.", prompts[1][0])
                     self.assertIn(instruction, prompts[1][0])
                     self.assertIn("You are VERIFY.", prompts[2][1])
@@ -308,13 +346,30 @@ class RoleSubAgentTests(unittest.TestCase):
                     self.assertEqual(buffer[2]["batch"].non_tensor_batch["is_action_valid"].tolist(), [False, True])
                     self.assertTrue(all(set(entry["batch"].non_tensor_batch) == set(buffer[0]["batch"].non_tensor_batch)
                                         for entry in buffer))
+                    other_action, other_reason = "", "finish"
+                    if env_name == "search":
+                        self.assertEqual(orchestra.return_reasons.tolist(), ["search", ""])
+                        actions, buffer = orchestra.run(*inputs)
+                        self.assertEqual(actions, [first_output, ""])
+                        self.assertEqual(buffer[0]["batch"].non_tensor_batch["agent_active_mask"].tolist(), [False, True])
+                        self.assertEqual(orchestra.return_reasons.tolist(), ["search", "finish"])
+                        self.assertEqual(orchestra.run(*inputs)[1], [])
+                        next_obs = {"text": ["A task with retrieved evidence", "B done"]}
+                        orchestra.initialize_context(next_obs)
+                        inputs = (inputs[0], next_obs, groups, np.array([True, False]), 2)
+                        scripts["Router Agent"] = deque([
+                            ["<route>ANSWER</route>", "<route>FINISH</route>"],
+                            ["<route>FINISH</route>", "<route>SEARCH</route>"],
+                        ])
+                        other_action, other_reason = "", ""
+                    prompt_start = len(prompts)
                     actions, _ = orchestra.run(*inputs)
-                    self.assertEqual(actions, ["final output", "review"])
-                    self.assertIn("first output", prompts[3][0])
-                    self.assertIn(f"You are {roles[2]}.", prompts[4][0])
+                    self.assertEqual(actions, ["final output", other_action])
+                    self.assertIn("retrieved evidence" if env_name == "search" else first_output, prompts[prompt_start][0])
+                    self.assertIn(f"You are {roles[2]}.", prompts[prompt_start + 1][0])
                     actions, _ = orchestra.run(*inputs)
-                    self.assertEqual(actions, ["final output", "review"])
-                    self.assertEqual(orchestra.return_reasons.tolist(), ["finish", "finish"])
+                    self.assertEqual(actions, ["final output", other_action])
+                    self.assertEqual(orchestra.return_reasons.tolist(), ["finish", other_reason])
                     self.assertTrue(all(not script for script in scripts.values()))
                     self.assertEqual(orchestra.run(*inputs)[1], [])
                     orchestra.reset()

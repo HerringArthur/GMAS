@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -122,6 +123,23 @@ class SubAgent(BaseAgent):
             [active and bool(response.strip()) for response, active in zip(text_responses, agent_active_mask)],
             dtype=bool,
         )
+        if self.name == "SEARCH":
+            for i, (response, active) in enumerate(zip(text_responses, agent_active_mask)):
+                if not active:
+                    continue
+                batch.non_tensor_batch["is_action_valid"][i] = False
+                content = response.strip()
+
+                # Remove the optional thought block before checking the request.
+                if content.startswith("<think>"):
+                    thought, closing_tag, content = content[len("<think>"):].partition("</think>")
+                    # The environment also scans the thought text for action tags.
+                    if not closing_tag or re.search(r"</?(think|search|answer)>", thought):
+                        continue
+                    content = content.strip()
+
+                match = re.fullmatch(r"<search>([^<>]+)</search>", content)
+                batch.non_tensor_batch["is_action_valid"][i] = match is not None and bool(match.group(1).strip())
         batch.non_tensor_batch["selected_role"] = np.full(len(text_responses), "", dtype=object)
         batch.non_tensor_batch["env_step"] = np.full(len(text_responses), step, dtype=object)
         return batch, text_responses

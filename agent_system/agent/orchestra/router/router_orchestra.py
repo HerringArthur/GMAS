@@ -26,10 +26,12 @@ Agent contract:
   exact configured role name or ``FINISH``, and marks other selections invalid
   through ``is_action_valid``. Its text contains any assignment
   instructions, which are passed to the selected role through team_context.
-* SubAgent uses its role name/configuration to select its prompt. It currently
-  checks that active responses are nonempty and supplies
-  an empty ``selected_role`` field. This module does not parse model-generated tags.
-  Each valid role response updates both team_context and text_actions.
+* SubAgent uses its role name/configuration to select its prompt. SEARCH validates
+  a single nonempty search request; other roles check for nonempty responses.
+  It supplies an empty ``selected_role`` field. This module does not parse
+  model-generated tags. All valid role responses update team_context. Only
+  SOLVE/REVISE in math and SEARCH/ANSWER in search update text_actions. A valid
+  SEARCH response in the search scene pauses that sample for environment execution.
 
 Example configuration, alongside a matching agent-to-worker-group mapping::
 
@@ -41,7 +43,7 @@ Example configuration, alongside a matching agent-to-worker-group mapping::
         router:
           max_loop_num: 4
 
-Role prompts belong to the agents. Detailed role-output validation and
+Role prompts belong to the agents. Further role-output validation and
 credit-assignment metadata are deferred.
 """
 
@@ -62,8 +64,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
     Each run() performs one Router call and at most one role call per sample.
     The rollout collector repeats run() and owns the round budget. Context and
     text actions persist between calls until initialize_context() starts the
-    next environment step, or reset() starts a new rollout. FINISH marks samples
-    ready for the next environment interaction.
+    next environment step, or reset() starts a new rollout. FINISH and valid
+    SEARCH responses mark samples ready for the next environment interaction.
     """
 
     ROUTER_AGENT = "Router Agent"
@@ -139,6 +141,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
 
         # 2. Dispatch each sample to its selected role. This traversal groups
         # batch rows by model; it does not run additional collaboration rounds.
+        scene = self.config.env.env_name
         for role in self.role_ids:
             role_mask = route_mask & (selections == role)
             if not role_mask.any():
@@ -154,7 +157,15 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             )
             valid_mask = role_mask & batch.non_tensor_batch["is_action_valid"]
             self.team_context = update_team_context(role, self.team_context, responses, valid_mask)
-            self.text_actions = update_text_action(self.text_actions, responses, valid_mask)
+            update_action = (
+                scene == "math" and role in ("SOLVE", "REVISE")
+            ) or (
+                scene == "search" and role in ("SEARCH", "ANSWER")
+            )
+            if update_action:
+                self.text_actions = update_text_action(self.text_actions, responses, valid_mask)
+            if scene == "search" and role == "SEARCH":
+                self.return_reasons[valid_mask] = "search"
             self.save_to_buffer(role, batch)
 
         return self.text_actions.copy(), self.multiagent_batch_buffer

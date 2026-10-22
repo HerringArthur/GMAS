@@ -32,7 +32,7 @@ ROLE_DESCRIPTIONS = {
         "REVISE": "Use the existing solution and review feedback to correct or prepare the answer.",
     },
     "search": {
-        "SEARCH": "Use the question and available information to formulate a targeted search request.",
+        "SEARCH": "Formulate a targeted search request. Valid requests are executed by the environment before your next decision; no FINISH is needed.",
         "VERIFY": "Check whether the retrieved evidence is reliable and supports the current conclusion.",
         "ANSWER": "Use the available evidence to compose a complete answer to the question.",
     },
@@ -51,9 +51,10 @@ You are the Router Agent. Read the task and shared work, then select the role
 needed next from the available roles below. Choose the order according to the
 current progress. You may select the same role again.
 
-FINISH submits the latest role response to the environment. Choose it when that
-response is ready for submission. If the latest response is only a review or
-intermediate work, select a role to prepare the response to submit.
+FINISH submits the latest saved candidate answer to the environment. Reviews
+update the shared context without replacing that answer. Choose FINISH when the
+candidate answer is ready for submission. If no candidate answer exists or it
+needs correction, select a role to prepare it.
 
 # Output Format
 Output exactly one <route>ROLE_NAME</route> or <route>FINISH</route>.
@@ -73,7 +74,7 @@ class RouterAgent(BaseAgent):
         role_descriptions = ROLE_DESCRIPTIONS[config.env.env_name]
         self.prompt += "\n# Available Roles\n" + "\n".join(
             f"- {role}: {role_descriptions[role]}" for role in self.role_ids
-        ) + "\n- FINISH: Submit the latest role response to the environment.\n"
+        ) + "\n- FINISH: Submit the latest saved candidate answer to the environment.\n"
 
     def call(
         self,
