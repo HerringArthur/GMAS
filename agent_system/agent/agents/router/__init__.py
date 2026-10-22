@@ -13,8 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
+from agent_system.agent.registry import AgentRegistry
+
 from .router_agent import RouterAgent
 from .subagent import SubAgent
+
+# Register the shared implementation under each role name. Orchestra creates
+# only the roles enabled in the current scene's configuration.
+for role in ("SOLVE", "VERIFY", "REVISE", "SEARCH", "ANSWER"):
+    AgentRegistry.register(role)(partial(SubAgent, name=role))
 
 __all__ = [
     "RouterAgent",

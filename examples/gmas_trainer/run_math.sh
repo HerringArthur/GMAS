@@ -48,14 +48,16 @@ norm_adv_by_std_in_grpo=True
 use_kl_in_reward=False
 
 ##################### Agent Configurations #####################
-agent_ids='["Router Agent","Sub Agent 1","Sub Agent 2","Sub Agent 3"]'
+env_name=math
+role_ids='["SOLVE","VERIFY","REVISE"]'
+agent_ids='["Router Agent","SOLVE","VERIFY","REVISE"]'
 model_ids='["Qwen/Qwen3-4B","Qwen/Qwen3-4B","Qwen/Qwen3-4B","Qwen/Qwen3-4B"]'
 model_sharing=False
 
 orchestra_type=router
-max_loop_num=4 # Internal Router/worker loops per environment step.
+max_loop_num=4 # Router/role collaboration rounds per environment step.
 
-# Per-agent overrides, ordered as Router, Sub Agent 1, Sub Agent 2, Sub Agent 3.
+# Per-agent overrides, ordered as Router, SOLVE, VERIFY, REVISE.
 actor_optim_lr='[1e-6,1e-6,1e-6,1e-6]'
 actor_ppo_micro_batch_size_per_gpu='[4,4,4,4]'
 
@@ -105,11 +107,12 @@ run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name
     algorithm.credit_mode=$credit_mode \
     algorithm.norm_adv_by_std_in_grpo=$norm_adv_by_std_in_grpo \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
-    env.env_name=math \
+    env.env_name="$env_name" \
     env.seed=0 \
     env.rollout.n=$group_size \
     env.rollout.val_n=$val_group_size \
     agent.agent_ids="$agent_ids" \
+    agent.role_ids="$role_ids" \
     agent.model_ids="$model_ids" \
     agent.model_sharing=$model_sharing \
     agent.use_agent_memory=False \

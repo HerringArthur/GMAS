@@ -4,7 +4,8 @@ defaults:
 
 agent:
   orchestra_type: router
-  agent_ids: ["Router Agent", "Sub Agent 1", "Sub Agent 2", "Sub Agent 3"]
+  agent_ids: ["Router Agent", "SOLVE", "VERIFY", "REVISE"]
+  role_ids: ["SOLVE", "VERIFY", "REVISE"]
   model_ids: ["Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "Qwen/Qwen3-4B"]
   model_sharing: false
   use_agent_memory: false

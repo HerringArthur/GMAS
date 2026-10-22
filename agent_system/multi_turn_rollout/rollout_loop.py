@@ -461,12 +461,14 @@ class MultiAgentTrajectoryCollector(TrajectoryCollector):
                 agent_id = a['agent_id']
                 agents_to_wg_mapping[agent_id] = wg_id
 
+        orchestra_kwargs = {}
         if orchestra_type == "search":
             from agent_system.agent.orchestra.search import SearchMultiAgentOrchestra as orchestra
         elif orchestra_type == "math":
             from agent_system.agent.orchestra.math import MathMultiAgentOrchestra as orchestra
         elif orchestra_type == "router":
             from agent_system.agent.orchestra.router import RouterMultiAgentOrchestra as orchestra
+            orchestra_kwargs["role_ids"] = config.agent.role_ids
         else:
             raise ValueError(f"Unknown orchestra_type '{orchestra_type}'.")
 
@@ -477,6 +479,7 @@ class MultiAgentTrajectoryCollector(TrajectoryCollector):
             tokenizers=tokenizers,
             processors=processors,
             config=config,
+            **orchestra_kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -510,17 +513,44 @@ class MultiAgentTrajectoryCollector(TrajectoryCollector):
         episode_lengths = np.zeros(batch_size, dtype=np.float32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
+        router_orchestra = self.config.agent.orchestra_type == "router"
+        max_rounds = self.config.agent.orchestra.router.max_loop_num if router_orchestra else 1
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
             ###############################
-            text_actions, multiagent_batch_buffer = self.multiagent_orchestra.run(
-                gen_batch=gen_batch,
-                env_obs=obs,
-                actor_rollout_wgs=actor_rollout_wg,
-                active_masks=active_masks,
-                step=_step+1
-            )
+            if router_orchestra:
+                # Router.run performs one collaboration round. Keep its context
+                # and latest text actions until samples finish.
+                self.multiagent_orchestra.initialize_context(obs)
+            multiagent_batch_buffer = []
+            text_actions = [""] * batch_size
+            for _round in range(max_rounds):
+                text_actions, round_buffer = self.multiagent_orchestra.run(
+                    gen_batch=gen_batch,
+                    env_obs=obs,
+                    actor_rollout_wgs=actor_rollout_wg,
+                    active_masks=active_masks,
+                    step=_step+1
+                )
+                multiagent_batch_buffer.extend(round_buffer)
+                if not router_orchestra or np.all(self.multiagent_orchestra.return_reasons[active_masks] != ""):
+                    break
+
+            if router_orchestra:
+                # On budget exhaustion submit the latest text action, without
+                # inventing a Router FINISH. Label only each sample's last call.
+                reasons = self.multiagent_orchestra.return_reasons
+                reasons[active_masks & (reasons == "")] = "loop_limit"
+                remaining = active_masks.copy()
+                for entry in reversed(multiagent_batch_buffer):
+                    metadata = entry['batch'].non_tensor_batch
+                    metadata['return_reason'] = np.full(batch_size, "", dtype=object)
+                    last_call = remaining & metadata['agent_active_mask']
+                    metadata['return_reason'][last_call] = reasons[last_call]
+                    remaining[last_call] = False
+
+            # Submit the latest text actions after collaboration ends.
             next_obs, rewards, dones, infos = envs.step(text_actions)
             ###############################
             if len(rewards.shape) == 2:
