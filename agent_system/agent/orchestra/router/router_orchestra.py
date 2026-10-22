@@ -22,6 +22,8 @@ Agent contract:
 * All agents expose the usual ``call(...) -> (DataProto, List[str])`` interface
   and return a full-size batch with ``is_action_valid``, ``agent_active_mask``,
   ``wg_id`` and ``env_step`` for each input row. Inactive rows are invalid.
+  Each call receives the latest ``candidate_answers`` separately from history,
+  so agents can read a candidate even when its original history entry is absent.
 * RouterAgent additionally returns ``non_tensor_batch['selected_role']``: an
   exact configured role name or ``FINISH``, and marks other selections invalid
   through ``is_action_valid``. Its text contains any assignment
@@ -177,6 +179,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             gen_batch=gen_batch,
             env_obs=env_obs,
             team_context=self.team_context,
+            candidate_answers=self.candidate_answers,
             actor_rollout_wg=actor_rollout_wg,
             agent_active_mask=pending_mask,
             step=step,
@@ -202,6 +205,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                 gen_batch=gen_batch,
                 env_obs=env_obs,
                 team_context=self.team_context,
+                candidate_answers=self.candidate_answers,
                 actor_rollout_wg=actor_rollout_wg,
                 agent_active_mask=role_mask,
                 step=step,

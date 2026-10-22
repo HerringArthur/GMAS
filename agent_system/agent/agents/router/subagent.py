@@ -28,12 +28,18 @@ SUBAGENT_PROMPT = """
 # Task Introduction
 {env_prompt}
 
+# Current Candidate Answer
+The latest saved candidate is provided below for evaluation and improvement.
+Being saved does not imply that it is correct or has been verified.
+{candidate_answer}
+
 # Your Teammates' Outputs at Step {step}
 {team_context}
 
 # Your Assignment
-Use the original task, shared work, and the latest Router assignment to perform
-your role. Return your work so the Router can choose the next step.
+Use the original task, current candidate answer, shared work, and the latest
+Router assignment to perform your role. Return your work so the Router can
+choose the next step.
 """
 
 
@@ -107,8 +113,9 @@ class SubAgent(BaseAgent):
         actor_rollout_wg,
         agent_active_mask,
         step: int,
+        candidate_answers: List[str],
     ) -> Tuple[DataProto, List[str]]:
-        obs = self.build_prompt(env_obs, team_context, step)
+        obs = self.build_prompt(env_obs, team_context, step, candidate_answers=candidate_answers)
         batch = preprocess_batch(
             gen_batch=gen_batch,
             obs=obs,

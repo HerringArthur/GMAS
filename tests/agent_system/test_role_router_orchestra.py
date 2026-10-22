@@ -54,6 +54,7 @@ class ScriptedAgent:
         self.calls.append({
             **kwargs,
             "team_context": list(kwargs["team_context"]),
+            "candidate_answers": list(kwargs["candidate_answers"]),
             "agent_active_mask": kwargs["agent_active_mask"].copy(),
         })
         if not self.script:
@@ -196,15 +197,20 @@ class RoleRouterTests(unittest.TestCase):
         self.assertEqual([row["agent_id"] for row in first_buffer], ["Router Agent", "SOLVE"])
         self.assertEqual(orchestra.return_reasons.tolist(), [""])
         self.assertEqual(len(orchestra.agents["Router Agent"].calls), 1)
+        self.assertEqual(orchestra.agents["Router Agent"].calls[0]["candidate_answers"], [""])
+        self.assertEqual(orchestra.agents["SOLVE"].calls[0]["candidate_answers"], [""])
 
         self.route(["VERIFY"])
         self.respond("VERIFY", ["The derivation contains an error"])
         self.assertEqual(self.run_round()[0], ["Initial answer"])
         self.assertIn("Initial answer", orchestra.agents["Router Agent"].calls[-1]["team_context"][0])
+        self.assertEqual(orchestra.agents["Router Agent"].calls[-1]["candidate_answers"], ["Initial answer"])
+        self.assertEqual(orchestra.agents["VERIFY"].calls[-1]["candidate_answers"], ["Initial answer"])
         self.route(["REVISE"])
         revised_batch = self.respond("REVISE", ["Corrected answer"])
         self.assertEqual(self.run_round()[0], ["Corrected answer"])
         revision = orchestra.agents["REVISE"].calls[0]
+        self.assertEqual(revision["candidate_answers"], ["Initial answer"])
         self.assertIn('The output of "VERIFY": The derivation contains an error', revision["team_context"][0])
         self.assertIn("Assignment: REVISE", revision["team_context"][0])
         self.assertIs(revision["actor_rollout_wg"], self.groups["policy:REVISE"])
@@ -215,6 +221,7 @@ class RoleRouterTests(unittest.TestCase):
         self.route(["FINISH"])
         actions, final_buffer = self.run_round()
         self.assertEqual(actions, ["Corrected answer"])
+        self.assertEqual(orchestra.agents["Router Agent"].calls[-1]["candidate_answers"], ["Corrected answer"])
         self.assertEqual([row["agent_id"] for row in final_buffer], ["Router Agent"])
         self.assertEqual(orchestra.return_reasons.tolist(), ["finish"])
         self.assertEqual(self.run_round()[1], [])
@@ -271,6 +278,8 @@ class RoleRouterTests(unittest.TestCase):
         self.respond("VERIFY", ["new report"])
         self.assertEqual(self.run_round()[0], [""])
         self.assertEqual(orchestra.candidate_answers, [""])
+        self.assertEqual(orchestra.agents["Router Agent"].calls[-1]["candidate_answers"], [""])
+        self.assertEqual(orchestra.agents["VERIFY"].calls[-1]["candidate_answers"], [""])
         self.assertIn("new report", orchestra.team_context[0])
         self.assertNotIn("old answer", orchestra.team_context[0])
         self.assertEqual(orchestra.return_reasons.tolist(), [""])
@@ -292,6 +301,7 @@ class RoleRouterTests(unittest.TestCase):
             self.respond(role, [response])
             self.run_round()
         previous_context = orchestra.team_context.copy()
+        self.assertEqual(orchestra.agents["SEARCH"].calls[-1]["candidate_answers"], ["Candidate answer"])
         self.assertEqual(orchestra.candidate_answers, ["Candidate answer"])
         self.assertEqual(orchestra.text_actions, ["<search>supporting evidence</search>"])
         self.assertEqual(orchestra.return_reasons.tolist(), ["search"])
@@ -309,6 +319,8 @@ class RoleRouterTests(unittest.TestCase):
         self.assertEqual(self.run_round(step=2, observation=next_obs["text"])[0], [""])
         router_call = orchestra.agents["Router Agent"].calls[-1]
         self.assertEqual(router_call["team_context"], previous_context)
+        self.assertEqual(router_call["candidate_answers"], ["Candidate answer"])
+        self.assertEqual(orchestra.agents["VERIFY"].calls[-1]["candidate_answers"], ["Candidate answer"])
         self.assertEqual(router_call["env_obs"], next_obs)
         self.assertTrue(orchestra.team_context[0].startswith(previous_context[0]))
         self.assertIn("The new evidence supports the candidate", orchestra.team_context[0])

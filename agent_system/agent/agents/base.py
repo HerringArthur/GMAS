@@ -17,7 +17,7 @@ from __future__ import annotations
 """
 Agent definitions.
 """
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 import copy
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -47,21 +47,31 @@ class BaseAgent:
     def reset(self):
         pass
 
-    def build_prompt(self, env_obs: Dict[str, Any], team_context: List[str], step: int) -> str:
-        """Build the prompt for the agent based on the observation."""
+    def build_prompt(
+        self,
+        env_obs: Dict[str, Any],
+        team_context: List[str],
+        step: int,
+        candidate_answers: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Build the prompt, optionally including each sample's current candidate."""
         # Naive Implementation
         obs = copy.deepcopy(env_obs)
         bs = len(obs['text'])
         for i in range(bs):
+            candidate_answer = candidate_answers[i] if candidate_answers is not None else ""
+            candidate_answer = candidate_answer or "No candidate answer has been generated yet."
             if self.start_tag is not None and self.end_tag is not None:
                 obs['text'][i] = self.prompt.format(env_prompt=obs['text'][i],
                                                     team_context=team_context[i],
+                                                    candidate_answer=candidate_answer,
                                                     step=step,
                                                     start_tag=self.start_tag,
                                                     end_tag=self.end_tag)
             else:
                 obs['text'][i] = self.prompt.format(env_prompt=obs['text'][i],
                                                     team_context=team_context[i],
+                                                    candidate_answer=candidate_answer,
                                                     step=step)
         return obs
 

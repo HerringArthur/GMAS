@@ -69,7 +69,7 @@ class RoleRouterAgentTests(unittest.TestCase):
             "Router Agent", wg_id="router-policy", tokenizer=None, processor=None, config=self.config,
         )
 
-    def call_router(self, responses, active=None, env_obs=None, team_context=None):
+    def call_router(self, responses, active=None, env_obs=None, team_context=None, candidate_answers=None):
         size = len(responses)
         mask = np.array(active if active is not None else [True] * size, dtype=bool)
         raw_response_tokens = object()
@@ -91,6 +91,7 @@ class RoleRouterAgentTests(unittest.TestCase):
                     actor_rollout_wg=group,
                     agent_active_mask=mask,
                     step=2,
+                    candidate_answers=candidate_answers if candidate_answers is not None else [""] * size,
                 )
         generate.assert_called_once_with(batch, group, mask, gen_batch.meta_info)
         self.assertIs(preprocess.call_args.kwargs["agent_active_mask"], mask)
@@ -101,6 +102,25 @@ class RoleRouterAgentTests(unittest.TestCase):
         self.assertEqual(result.non_tensor_batch["wg_id"].tolist(), ["router-policy"] * size)
         self.assertEqual(result.non_tensor_batch["env_step"].tolist(), [2] * size)
         return result, preprocess.call_args.kwargs["obs"]
+
+    def test_candidates_are_visible_without_history_and_stay_aligned_per_sample(self):
+        candidates = [
+            r"Full derivation A with {x}, ending in \boxed{42}",
+            "<think>Reasoning B</think><answer>Paris</answer>",
+            "",
+        ]
+        _, obs = self.call_router(["<route>VERIFY</route>"] * 3, candidate_answers=candidates)
+        for i, prompt in enumerate(obs["text"]):
+            self.assertIn("# Current Candidate Answer", prompt)
+            self.assertIn("Being saved does not imply that it is correct or has been verified.", prompt)
+            if candidates[i]:
+                self.assertIn(candidates[i], prompt)
+                self.assertNotIn("No candidate answer has been generated yet.", prompt)
+            else:
+                self.assertIn("No candidate answer has been generated yet.", prompt)
+            for j, candidate in enumerate(candidates):
+                if i != j and candidate:
+                    self.assertNotIn(candidate, prompt)
 
     def test_role_choices_finish_and_inactive_rows_preserve_batch_alignment(self):
         responses = [
@@ -210,13 +230,24 @@ class RoleSubAgentTests(unittest.TestCase):
                     )
                     observation = {"text": ["Original task {x}"], "image": ["image"]}
                     context = ['The output of "Router Agent": <think>Check the evidence.</think>']
-                    prompt = agent.build_prompt(observation, context, step=2)
+                    candidate = r"Candidate with full reasoning and \boxed{42}"
+                    batch = SimpleNamespace(non_tensor_batch={})
+                    response = "<search>supporting evidence</search>" if role == "SEARCH" else "Role output"
+                    with patch.object(subagent_module, "preprocess_batch", return_value=batch) as preprocess:
+                        with patch.object(agent, "_generate_with_llm", return_value=(batch, [response])):
+                            agent.call(
+                                SimpleNamespace(meta_info={}), observation, context,
+                                object(), np.array([True]), step=2, candidate_answers=[candidate],
+                            )
+                    prompt = preprocess.call_args.kwargs["obs"]
                     self.assertIsInstance(agent, subagent_module.SubAgent)
                     self.assertEqual(agent.name, role)
                     self.assertEqual(agent.wg_id, f"policy:{role}")
                     self.assertIn(f"You are {role}.", prompt["text"][0])
                     self.assertIn(expected_instruction, prompt["text"][0])
                     self.assertIn(context[0], prompt["text"][0])
+                    self.assertIn("# Current Candidate Answer", prompt["text"][0])
+                    self.assertIn(candidate, prompt["text"][0])
                     self.assertIn("Original task {x}", prompt["text"][0])
                     self.assertIn("Step 2", prompt["text"][0])
                     if env_name == "math" and role in ("SOLVE", "REVISE"):
@@ -238,10 +269,12 @@ class RoleSubAgentTests(unittest.TestCase):
         )
         gen_batch = SimpleNamespace(meta_info={})
         group = object()
+        candidates = [r"First derivation: \boxed{1}", "Second candidate", "Inactive candidate", ""]
         with patch.object(subagent_module, "preprocess_batch", return_value=batch) as preprocess:
             with patch.object(agent, "_generate_with_llm", return_value=(batch, responses)) as generate:
                 returned_batch, returned_responses = agent.call(
                     gen_batch, {"text": ["Problem"] * 4}, ["shared work"] * 4, group, mask, step=1,
+                    candidate_answers=candidates,
                 )
         generate.assert_called_once_with(batch, group, mask, gen_batch.meta_info)
         self.assertIs(preprocess.call_args.kwargs["agent_active_mask"], mask)
@@ -251,6 +284,12 @@ class RoleSubAgentTests(unittest.TestCase):
         self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(), [True, False, False, False])
         self.assertEqual(batch.non_tensor_batch["selected_role"].tolist(), [""] * 4)
         self.assertEqual(batch.non_tensor_batch["env_step"].tolist(), [1] * 4)
+        prompts = preprocess.call_args.kwargs["obs"]["text"]
+        self.assertIn(candidates[0], prompts[0])
+        self.assertNotIn(candidates[1], prompts[0])
+        self.assertIn(candidates[1], prompts[1])
+        self.assertNotIn(candidates[0], prompts[1])
+        self.assertIn("No candidate answer has been generated yet.", prompts[3])
 
     def test_search_requires_one_nonempty_request_and_preserves_generated_text(self):
         agent = AgentRegistry.create(
@@ -282,6 +321,7 @@ class RoleSubAgentTests(unittest.TestCase):
                 returned_batch, returned_responses = agent.call(
                     SimpleNamespace(meta_info={}), {"text": ["Question"] * size},
                     [""] * size, object(), mask, step=1,
+                    candidate_answers=[""] * size,
                 )
         self.assertIs(returned_batch, batch)
         self.assertIs(returned_responses, responses)
@@ -371,8 +411,15 @@ class RoleSubAgentTests(unittest.TestCase):
                     self.assertIn(instruction, prompts[prompt_start][0])
                     self.assertIn(f"You are {roles[2]}.", prompts[prompt_start + 1][0])
                     self.assertIn(first_output, prompts[prompt_start + 1][0])
+                    # A saved candidate must remain visible even if its original
+                    # history entry is no longer part of the prompt.
+                    orchestra.team_context = ["", ""]
+                    prompt_start = len(prompts)
                     actions, _ = orchestra.run(*inputs)
                     self.assertEqual(actions, ["final output", other_action])
+                    self.assertIn("# Current Candidate Answer", prompts[prompt_start][0])
+                    self.assertIn("final output", prompts[prompt_start][0])
+                    self.assertNotIn("final output", prompts[prompt_start][1])
                     self.assertEqual(orchestra.return_reasons.tolist(), ["finish", other_reason])
                     self.assertTrue(all(not script for script in scripts.values()))
                     self.assertEqual(orchestra.run(*inputs)[1], [])

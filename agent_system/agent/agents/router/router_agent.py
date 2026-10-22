@@ -43,13 +43,18 @@ ROUTER_PROMPT = """
 # Task Introduction
 {env_prompt}
 
+# Current Candidate Answer
+The latest saved candidate is provided below for evaluation and improvement.
+Being saved does not imply that it is correct or has been verified.
+{candidate_answer}
+
 # Your Teammates' Outputs
 {team_context}
 
 # Your Role
-You are the Router Agent. Read the task and shared work, then select the role
-needed next from the available roles below. Choose the order according to the
-current progress. You may select the same role again.
+You are the Router Agent. Read the task, current candidate answer, and shared
+work, then select the role needed next from the available roles below. Choose
+the order according to the current progress. You may select the same role again.
 
 FINISH submits the latest saved candidate answer to the environment. Reviews
 update the shared context without replacing that answer. Choose FINISH when the
@@ -84,8 +89,9 @@ class RouterAgent(BaseAgent):
         actor_rollout_wg,
         agent_active_mask,
         step: int,
+        candidate_answers: List[str],
     ) -> Tuple[DataProto, List[str]]:
-        obs = self.build_prompt(env_obs, team_context, step)
+        obs = self.build_prompt(env_obs, team_context, step, candidate_answers=candidate_answers)
         batch = preprocess_batch(
             gen_batch=gen_batch,
             obs=obs,
