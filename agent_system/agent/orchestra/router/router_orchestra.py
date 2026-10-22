@@ -62,10 +62,11 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
     """Let each active sample choose its next role independently.
 
     Each run() performs one Router call and at most one role call per sample.
-    The rollout collector repeats run() and owns the round budget. Context and
-    text actions persist between calls until initialize_context() starts the
-    next environment step, or reset() starts a new rollout. FINISH and valid
-    SEARCH responses mark samples ready for the next environment interaction.
+    The rollout collector repeats run() and owns the round budget. Team context
+    persists across environment steps until reset() starts a new rollout.
+    initialize_context() clears pending actions and return reasons for each
+    environment step. FINISH and valid SEARCH responses mark samples ready for
+    the next environment interaction.
     """
 
     ROUTER_AGENT = "Router Agent"
@@ -102,8 +103,11 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.return_reasons = None
 
     def initialize_context(self, env_obs):
-        """Start an environment step; subsequent run() calls share this state."""
-        self.text_actions, self.team_context, env_obs = super().initialize_context(env_obs)
+        """Start an environment step while preserving this rollout's team context."""
+        text_actions, team_context, env_obs = super().initialize_context(env_obs)
+        if self.team_context is None:
+            self.team_context = team_context
+        self.text_actions = text_actions
         self.return_reasons = np.full(len(self.text_actions), "", dtype=object)
         return self.text_actions, self.team_context, env_obs
 
