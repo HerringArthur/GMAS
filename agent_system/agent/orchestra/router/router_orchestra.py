@@ -30,8 +30,9 @@ Agent contract:
   a single nonempty search request; other roles check for nonempty responses.
   It supplies an empty ``selected_role`` field. This module does not parse
   model-generated tags. All valid role responses update team_context. Only
-  SOLVE/REVISE in math and SEARCH/ANSWER in search update text_actions. A valid
-  SEARCH response in the search scene pauses that sample for environment execution.
+  SOLVE/REVISE in math and SEARCH/ANSWER in search update text_actions. Answer
+  roles also save candidate_answers, which FINISH copies into text_actions.
+  A valid SEARCH response in the search scene pauses that sample for environment execution.
 
 Example configuration, alongside a matching agent-to-worker-group mapping::
 
@@ -48,14 +49,53 @@ credit-assignment metadata are deferred.
 """
 
 import importlib
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from transformers import PreTrainedTokenizer
 
 from verl import DataProto
 
-from agent_system.agent.orchestra.base import BaseOrchestra, update_team_context, update_text_action
+from agent_system.agent.orchestra.base import BaseOrchestra
+
+
+def update_team_context(
+    agent_id: str,
+    team_context: List[str],
+    text_response: List[str],
+    agent_active_mask: Optional[np.ndarray] = None,
+) -> List[str]:
+    """Append full Router or role outputs to each selected sample's history.
+
+    The caller selects active, valid responses with the mask. Existing history
+    is retained; reset() controls when a new rollout starts with empty context.
+    """
+    if agent_active_mask is None:
+        agent_active_mask = np.ones(len(team_context), dtype=bool)
+
+    for i in range(len(team_context)):
+        if agent_active_mask[i]:
+            team_context[i] += f'\nThe output of "{agent_id}": {text_response[i]}\n'
+    return team_context
+
+
+def update_text_action(
+    text_actions: List[str],
+    text_response: List[str],
+    agent_active_mask: Optional[np.ndarray] = None,
+) -> List[str]:
+    """Replace selected entries in an action or candidate-answer list in place.
+
+    The caller chooses which roles may update the list. Sources can be fresh
+    responses or saved candidates submitted by FINISH or the round limit.
+    """
+    if agent_active_mask is None:
+        agent_active_mask = np.ones(len(text_actions), dtype=bool)
+
+    for i in range(len(text_actions)):
+        if agent_active_mask[i]:
+            text_actions[i] = text_response[i]
+    return text_actions
 
 
 class RouterMultiAgentOrchestra(BaseOrchestra):
@@ -63,7 +103,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
 
     Each run() performs one Router call and at most one role call per sample.
     The rollout collector repeats run() and owns the round budget. Team context
-    persists across environment steps until reset() starts a new rollout.
+    and candidate answers persist across environment steps until reset() starts
+    a new rollout.
     initialize_context() clears pending actions and return reasons for each
     environment step. FINISH and valid SEARCH responses mark samples ready for
     the next environment interaction.
@@ -94,19 +135,23 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.role_ids = role_ids
         self.team_context = None
         self.text_actions = None
+        self.candidate_answers = None
         self.return_reasons = None
 
     def reset(self):
         super().reset()
         self.team_context = None
         self.text_actions = None
+        self.candidate_answers = None
         self.return_reasons = None
 
     def initialize_context(self, env_obs):
-        """Start an environment step while preserving this rollout's team context."""
+        """Start an environment step, retaining team context and candidate answers."""
         text_actions, team_context, env_obs = super().initialize_context(env_obs)
         if self.team_context is None:
             self.team_context = team_context
+        if self.candidate_answers is None:
+            self.candidate_answers = [""] * len(text_actions)
         self.text_actions = text_actions
         self.return_reasons = np.full(len(self.text_actions), "", dtype=object)
         return self.text_actions, self.team_context, env_obs
@@ -141,7 +186,9 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         route_mask = pending_mask & router_batch.non_tensor_batch["is_action_valid"]
         self.team_context = update_team_context(self.ROUTER_AGENT, self.team_context, router_responses, route_mask)
         self.save_to_buffer(self.ROUTER_AGENT, router_batch)
-        self.return_reasons[route_mask & finish_mask] = "finish"
+        submit_mask = route_mask & finish_mask
+        self.text_actions = update_text_action(self.text_actions, self.candidate_answers, submit_mask)
+        self.return_reasons[submit_mask] = "finish"
 
         # 2. Dispatch each sample to its selected role. This traversal groups
         # batch rows by model; it does not run additional collaboration rounds.
@@ -161,12 +208,14 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             )
             valid_mask = role_mask & batch.non_tensor_batch["is_action_valid"]
             self.team_context = update_team_context(role, self.team_context, responses, valid_mask)
-            update_action = (
+            update_answer = (
                 scene == "math" and role in ("SOLVE", "REVISE")
             ) or (
-                scene == "search" and role in ("SEARCH", "ANSWER")
+                scene == "search" and role == "ANSWER"
             )
-            if update_action:
+            if update_answer:
+                self.candidate_answers = update_text_action(self.candidate_answers, responses, valid_mask)
+            if update_answer or (scene == "search" and role == "SEARCH"):
                 self.text_actions = update_text_action(self.text_actions, responses, valid_mask)
             if scene == "search" and role == "SEARCH":
                 self.return_reasons[valid_mask] = "search"

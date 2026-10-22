@@ -25,6 +25,7 @@ import uuid
 from agent_system.multi_turn_rollout.utils import to_list_of_dict, torch_to_numpy, filter_group_data, preprocess_batch
 from agent_system.environments import EnvironmentManagerBase
 from agent_system.agent import BaseOrchestra
+from agent_system.agent.orchestra.router.router_orchestra import update_text_action
 from typing import List, Dict, Any, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
@@ -538,10 +539,17 @@ class MultiAgentTrajectoryCollector(TrajectoryCollector):
                     break
 
             if router_orchestra:
-                # On budget exhaustion submit the latest text action, without
+                # On budget exhaustion submit the saved candidate answer, without
                 # inventing a Router FINISH. Label only each sample's last call.
                 reasons = self.multiagent_orchestra.return_reasons
-                reasons[active_masks & (reasons == "")] = "loop_limit"
+                limit_mask = active_masks & (reasons == "")
+                self.multiagent_orchestra.text_actions = update_text_action(
+                    self.multiagent_orchestra.text_actions,
+                    self.multiagent_orchestra.candidate_answers,
+                    limit_mask,
+                )
+                text_actions = self.multiagent_orchestra.text_actions.copy()
+                reasons[limit_mask] = "loop_limit"
                 remaining = active_masks.copy()
                 for entry in reversed(multiagent_batch_buffer):
                     metadata = entry['batch'].non_tensor_batch

@@ -365,8 +365,12 @@ class RoleSubAgentTests(unittest.TestCase):
                     prompt_start = len(prompts)
                     actions, _ = orchestra.run(*inputs)
                     self.assertEqual(actions, ["final output", other_action])
+                    self.assertEqual(orchestra.candidate_answers, ["final output", ""])
                     self.assertIn("retrieved evidence" if env_name == "search" else first_output, prompts[prompt_start][0])
+                    self.assertIn(first_output, prompts[prompt_start][0])
+                    self.assertIn(instruction, prompts[prompt_start][0])
                     self.assertIn(f"You are {roles[2]}.", prompts[prompt_start + 1][0])
+                    self.assertIn(first_output, prompts[prompt_start + 1][0])
                     actions, _ = orchestra.run(*inputs)
                     self.assertEqual(actions, ["final output", other_action])
                     self.assertEqual(orchestra.return_reasons.tolist(), ["finish", other_reason])
@@ -374,6 +378,7 @@ class RoleSubAgentTests(unittest.TestCase):
                     self.assertEqual(orchestra.run(*inputs)[1], [])
                     orchestra.reset()
                     self.assertIsNone(orchestra.team_context)
+                    self.assertIsNone(orchestra.candidate_answers)
 
 
 if __name__ == "__main__":
