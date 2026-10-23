@@ -532,16 +532,67 @@ class RoleRouterTests(unittest.TestCase):
         self.assertEqual(self.run_round(active=(True, True, False))[1], [])
 
     def test_collector_executes_search_without_waiting_for_finish(self):
-        orchestra = self.make_orchestra(roles=("SEARCH",), env_name="search")
-        self.config.env.max_steps = 1
+        orchestra = self.make_orchestra(roles=("SEARCH", "ANSWER"), env_name="search")
         self.route(["SEARCH"])
         query = "<search>query</search>"
         self.respond("SEARCH", [query])
-        env = ScriptedEnvironment(["Problem"], [(["Retrieved evidence"], [0.0], [False])], on_step=lambda: self.assertEqual(
-            len(orchestra.agents["Router Agent"].calls), 1))
+        self.route(["ANSWER"])
+        self.respond("ANSWER", ["<answer>A</answer>"])
+        self.route(["FINISH"])
+        env = ScriptedEnvironment(["Problem"], [
+            (["Retrieved evidence"], [0.0], [False]),
+            (None, [1.0], [True]),
+        ], on_step=lambda: self.assertEqual(
+            len(orchestra.agents["Router Agent"].calls), 1 if len(env.actions) == 1 else 3))
         rows, *_ = self.collect(env)
-        self.assertEqual(env.actions, [[query]])
-        self.assertEqual([row["return_reason"] for row in rows[0]], ["", "search"])
+        self.assertEqual(env.actions, [[query], ["<answer>A</answer>"]])
+        self.assertEqual([row["return_reason"] for row in rows[0]][:2], ["", "search"])
+
+    def test_final_search_step_blocks_search_and_preserves_other_choices(self):
+        orchestra = self.make_orchestra(roles=("SEARCH", "VERIFY", "ANSWER"), env_name="search")
+        router_batch = self.route(["SEARCH", "VERIFY", "ANSWER", "FINISH", "SEARCH"])
+        self.respond("VERIFY", ["ignored", "review", "ignored", "ignored", "inactive"])
+        self.respond("ANSWER", ["ignored", "ignored", "<answer>A</answer>", "ignored", "inactive"])
+        actions, buffer = self.run_round(active=(True, True, True, True, False), step=2)
+        self.assertEqual(actions, ["", "", "<answer>A</answer>", "", ""])
+        self.assertEqual(router_batch.non_tensor_batch["is_action_valid"].tolist(),
+                         [False, True, True, True, False])
+        self.assertEqual(router_batch.non_tensor_batch["selected_role"][0], "SEARCH")
+        self.assertEqual(router_batch.batch["responses"][0], "Assignment: SEARCH")
+        self.assertFalse(orchestra.agents["SEARCH"].calls)
+        self.assertEqual(orchestra.role_paths, [(), ("VERIFY",), ("ANSWER",), (), ()])
+        self.assertEqual(orchestra.team_context[0], [""])
+        self.assertEqual(orchestra.return_reasons.tolist(), ["", "", "", "finish", ""])
+        self.assertEqual([entry["agent_id"] for entry in buffer], ["Router Agent", "VERIFY", "ANSWER"])
+
+    def test_final_search_step_retries_blocked_search_then_submits_candidates_at_limit(self):
+        orchestra = self.make_orchestra(loops=2, roles=("SEARCH", "VERIFY", "ANSWER"), env_name="search")
+        saved = "<answer>Saved A</answer>"
+        fresh = "<answer>New B</answer>"
+        queries = ["<search>evidence for A</search>", "<search>evidence for B</search>"]
+        self.route(["ANSWER", "SEARCH"])
+        self.respond("ANSWER", [saved, "ignored"])
+        self.respond("SEARCH", ["ignored", queries[1]])
+        self.route(["SEARCH", "FINISH"])
+        self.respond("SEARCH", [queries[0], "ignored"])
+        self.route(["SEARCH", "SEARCH"])
+        self.route(["VERIFY", "ANSWER"])
+        self.respond("VERIFY", ["A is supported", "ignored"])
+        self.respond("ANSWER", ["ignored", fresh])
+        env = ScriptedEnvironment(["A problem", "B problem"], [
+            (["A evidence", "B evidence"], [0.0, 0.0], [False, False]),
+            (None, [1.0, 1.0], [True, True]),
+        ])
+        rows, *_ = self.collect(env)
+        self.assertEqual(env.actions, [queries, [saved, fresh]])
+        self.assertEqual(orchestra.candidate_answers, [saved, fresh])
+        self.assertEqual([row[-1]["return_reason"] for row in rows], ["loop_limit", "loop_limit"])
+        for sample in rows:
+            final_rows = [row for row in sample if row["env_step"] == 2]
+            self.assertEqual(final_rows[0]["selected_role"], "SEARCH")
+            self.assertFalse(final_rows[0]["is_action_valid"])
+            self.assertFalse(any(row["agent_id"] == "SEARCH" for row in final_rows))
+        self.assertEqual(orchestra.role_paths, [("ANSWER", "SEARCH", "VERIFY"), ("SEARCH", "ANSWER")])
 
     def test_collector_budget_fallback_submits_saved_answer_and_labels_last_call(self):
         self.make_orchestra(loops=2)
@@ -583,6 +634,7 @@ class RoleRouterTests(unittest.TestCase):
 
     def test_budget_fallback_uses_prior_candidate_and_preserves_search_and_finish_actions(self):
         orchestra = self.make_orchestra(loops=2, roles=("SEARCH", "VERIFY", "ANSWER"), env_name="search")
+        self.config.env.max_steps = 3
         answers = ["<answer>A</answer>", "<answer>B</answer>", "<answer>C</answer>"]
         queries = [f"<search>evidence for {name}</search>" for name in ("A", "B", "C")]
         self.route(["ANSWER"] * 3)
@@ -595,15 +647,18 @@ class RoleRouterTests(unittest.TestCase):
         self.respond("VERIFY", ["ignored", "ignored", "C needs another check"])
         self.route(["ANSWER"] * 3)
         self.respond("ANSWER", ["ignored", "ignored", "invalid answer"], valid=[True, True, False])
+        self.route(["FINISH"] * 3)
         env = ScriptedEnvironment(["A problem", "B problem", "C problem"], [
             (["A evidence", "B evidence", "C evidence"], [0.0] * 3, [False] * 3),
             (["A done", "More B evidence", "C done"], [1.0, 0.0, 1.0], [True, False, True]),
+            (None, [0.0, 1.0, 0.0], [True, True, True]),
         ])
         rows, *_ = self.collect(env)
-        self.assertEqual(env.actions, [queries, [answers[0], next_query, answers[2]]])
+        self.assertEqual(env.actions, [queries, [answers[0], next_query, answers[2]], ["", answers[1], ""]])
         self.assertEqual(orchestra.text_actions, env.actions[-1])
         self.assertEqual(orchestra.candidate_answers, answers)
-        self.assertEqual([sample[-1]["return_reason"] for sample in rows], ["finish", "search", "loop_limit"])
+        self.assertEqual([sample[-1]["return_reason"] for sample in rows], ["finish", "finish", "loop_limit"])
+        self.assertEqual([row["return_reason"] for row in rows[1] if row["env_step"] == 2][-1], "search")
         self.assertEqual(orchestra.agents["ANSWER"].calls[-1]["agent_active_mask"].tolist(), [False, False, True])
         self.assertFalse(rows[2][-1]["is_action_valid"])
         self.assertNotIn("invalid answer", "".join(orchestra.team_context[2]))

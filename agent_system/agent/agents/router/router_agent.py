@@ -76,10 +76,6 @@ class RouterAgent(BaseAgent):
     def __init__(self, wg_id: str, tokenizer: PreTrainedTokenizer, processor, config: Any):
         super().__init__("Router Agent", ROUTER_PROMPT, wg_id, tokenizer, processor, config)
         self.role_ids = config.agent.role_ids
-        role_descriptions = ROLE_DESCRIPTIONS[config.env.env_name]
-        self.prompt += "\n# Available Roles\n" + "\n".join(
-            f"- {role}: {role_descriptions[role]}" for role in self.role_ids
-        ) + "\n- FINISH: Submit the latest saved candidate answer to the environment.\n"
 
     def call(
         self,
@@ -91,7 +87,20 @@ class RouterAgent(BaseAgent):
         step: int,
         candidate_answers: List[str],
     ) -> Tuple[DataProto, List[str]]:
+        last_search_step = self.config.env.env_name == "search" and step == self.config.env.max_steps
+        available_roles = [role for role in self.role_ids if not (last_search_step and role == "SEARCH")]
+        role_descriptions = ROLE_DESCRIPTIONS[self.config.env.env_name]
+        role_prompt = "\n# Available Roles\n" + "\n".join(
+            f"- {role}: {role_descriptions[role]}" for role in available_roles
+        ) + "\n- FINISH: Submit the latest saved candidate answer to the environment.\n"
+        if last_search_step:
+            role_prompt += (
+                "\nThis is the final environment step. SEARCH is unavailable. "
+                "Use the available evidence to prepare or check an answer, "
+                "then select FINISH to submit the saved candidate.\n"
+            )
         obs = self.build_prompt(env_obs, team_context, step, candidate_answers=candidate_answers)
+        obs["text"] = [prompt + role_prompt for prompt in obs["text"]]
         batch = preprocess_batch(
             gen_batch=gen_batch,
             obs=obs,

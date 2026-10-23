@@ -91,13 +91,13 @@ class RoleRouterAgentTests(unittest.TestCase):
     def setUp(self):
         self.config = SimpleNamespace(
             agent=SimpleNamespace(role_ids=["SOLVE", "VERIFY", "REVISE"]),
-            env=SimpleNamespace(env_name="math"),
+            env=SimpleNamespace(env_name="math", max_steps=4),
         )
         self.router = AgentRegistry.create(
             "Router Agent", wg_id="router-policy", tokenizer=None, processor=None, config=self.config,
         )
 
-    def call_router(self, responses, active=None, env_obs=None, team_context=None, candidate_answers=None):
+    def call_router(self, responses, active=None, env_obs=None, team_context=None, candidate_answers=None, step=2):
         size = len(responses)
         mask = np.array(active if active is not None else [True] * size, dtype=bool)
         raw_response_tokens = object()
@@ -118,7 +118,7 @@ class RoleRouterAgentTests(unittest.TestCase):
                     team_context=team_context if team_context is not None else [""] * size,
                     actor_rollout_wg=group,
                     agent_active_mask=mask,
-                    step=2,
+                    step=step,
                     candidate_answers=candidate_answers if candidate_answers is not None else [""] * size,
                 )
         generate.assert_called_once_with(batch, group, mask, gen_batch.meta_info)
@@ -128,7 +128,7 @@ class RoleRouterAgentTests(unittest.TestCase):
         self.assertIs(result.batch["responses"], raw_response_tokens)
         self.assertIs(result.non_tensor_batch["agent_active_mask"], mask)
         self.assertEqual(result.non_tensor_batch["wg_id"].tolist(), ["router-policy"] * size)
-        self.assertEqual(result.non_tensor_batch["env_step"].tolist(), [2] * size)
+        self.assertEqual(result.non_tensor_batch["env_step"].tolist(), [step] * size)
         return result, preprocess.call_args.kwargs["obs"]
 
     def test_candidates_are_visible_without_history_and_stay_aligned_per_sample(self):
@@ -209,6 +209,27 @@ class RoleRouterAgentTests(unittest.TestCase):
         self.assertEqual(env_obs["text"], ["Find {x}", "Second problem"])
         self.assertEqual(batch.non_tensor_batch["selected_role"].tolist(), ["", "SOLVE"])
         self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(), [False, True])
+
+    def test_final_search_step_prompt_removes_search_only_for_that_step(self):
+        self.config.env.env_name = "search"
+        self.config.agent.role_ids = ["SEARCH", "VERIFY", "ANSWER"]
+        self.router = router_module.RouterAgent("router-policy", None, None, self.config)
+        choices = ["<route>VERIFY</route>", "<route>ANSWER</route>", "<route>FINISH</route>"]
+        batch, obs = self.call_router(choices, step=4)
+        for prompt in obs["text"]:
+            self.assertNotIn("- SEARCH:", prompt)
+            self.assertIn("final environment step", prompt)
+            self.assertIn("SEARCH is unavailable", prompt)
+            for role in ("VERIFY", "ANSWER", "FINISH"):
+                self.assertIn(f"- {role}:", prompt)
+        self.assertTrue(batch.non_tensor_batch["is_action_valid"].all())
+
+        self.router.reset()
+        batch, obs = self.call_router(["<route>SEARCH</route>"], step=1)
+        self.assertIn("- SEARCH:", obs["text"][0])
+        self.assertNotIn("final environment step", obs["text"][0])
+        self.assertTrue(batch.non_tensor_batch["is_action_valid"][0])
+        self.assertEqual(self.config.agent.role_ids, ["SEARCH", "VERIFY", "ANSWER"])
 
     def test_scenarios_expose_only_their_roles_and_use_distinct_verification_instructions(self):
         scenarios = [
@@ -516,7 +537,7 @@ class RoleWorkerAgentTests(unittest.TestCase):
                 config = SimpleNamespace(
                     agent=SimpleNamespace(role_ids=roles, orchestra=SimpleNamespace(
                         router=SimpleNamespace(max_context_runs=1))),
-                    env=SimpleNamespace(env_name=env_name),
+                    env=SimpleNamespace(env_name=env_name, max_steps=2),
                 )
                 names = ["Router Agent", *roles]
                 mapping = {name: f"policy:{name}" for name in names}

@@ -209,6 +209,10 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         selections = router_batch.non_tensor_batch["selected_role"]
         finish_mask = selections == self.FINISH
         route_mask = pending_mask & router_batch.non_tensor_batch["is_action_valid"]
+        scene = self.config.env.env_name
+        if scene == "search" and step == self.config.env.max_steps:
+            route_mask &= selections != "SEARCH"
+        router_batch.non_tensor_batch["is_action_valid"] = route_mask
         parent_prefix_keys = np.fromiter(self.role_paths, dtype=object, count=len(self.role_paths))
         router_batch.non_tensor_batch["parent_prefix_key"] = parent_prefix_keys
         self.team_context = update_team_context(
@@ -229,7 +233,6 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
 
         # 2. Dispatch each sample to its selected role. This traversal groups
         # batch rows by model; it does not run additional collaboration rounds.
-        scene = self.config.env.env_name
         for role in self.role_ids:
             role_mask = route_mask & (selections == role)
             if not role_mask.any():
