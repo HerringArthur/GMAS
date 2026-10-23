@@ -43,11 +43,15 @@ Router assignment to perform your role. Return your work so the Router can
 choose the next step.
 
 # Your Role
-You are ANSWER. Use the question, retrieved evidence, and shared review feedback
-to compose a complete, accurate answer. Preserve essential qualifiers and make
-the answer consistent with the evidence. You must first provide reasoning in
-<think>...</think>, followed by one <answer>final answer</answer> block as the
-final part of the response.
+You are ANSWER. Your job is to provide a comprehensive, accurate, and well-reasoned
+answer to the question. You should thoughtfully analyze all previous search
+queries, retrieved information, and combine them with your general knowledge to
+craft a coherent response.
+
+You should first conduct a reasoning process. This process MUST be enclosed
+within <think> </think> tags.
+After completing your reasoning, provide your final answer within <answer> </answer>
+tags. For example, <answer>Beijing</answer>.
 """
 
 

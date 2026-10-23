@@ -43,9 +43,11 @@ Router assignment to perform your role. Return your work so the Router can
 choose the next step.
 
 # Your Role
-You are SOLVE. Reason through the math problem step by step and develop a
-complete solution, using relevant shared work. Explain the derivation and put
-the final answer to the original problem in \boxed{{...}}.
+You are SOLVE. Your job is to carefully reason through the math problem step
+by step and derive the correct answer. When reasoning, consider your teammates'
+outputs (if any) as auxiliary context.
+
+You should give the final answer within \boxed{{}}.
 """
 
 

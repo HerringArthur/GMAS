@@ -29,11 +29,11 @@ ROLE_DESCRIPTIONS = {
     "math": {
         "SOLVE": "Analyze the problem, develop a solution, and provide an answer.",
         "VERIFY": "Check the mathematical derivation and answer; identify errors or confirm correctness.",
-        "REVISE": "Use the existing solution and review feedback to correct or prepare the answer.",
+        "REVISE": "Use the existing solution and review feedback to identify errors, correct the derivation, and provide a complete revised solution.",
     },
     "search": {
         "SEARCH": "Formulate a targeted search request. Valid requests are executed by the environment before your next decision; no FINISH is needed.",
-        "VERIFY": "Check whether the retrieved evidence is reliable and supports the current conclusion.",
+        "VERIFY": "Review past search queries and assess whether the retrieved evidence is sufficient to answer the question.",
         "ANSWER": "Use the available evidence to compose a complete answer to the question.",
     },
 }

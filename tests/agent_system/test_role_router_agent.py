@@ -277,14 +277,14 @@ class RoleWorkerAgentTests(unittest.TestCase):
     def test_registered_roles_receive_scene_prompts_and_shared_assignment(self):
         scenarios = {
             "math": {
-                "SOLVE": "complete solution",
+                "SOLVE": "derive the correct answer",
                 "VERIFY": "mathematical solution",
                 "REVISE": "complete revised solution",
             },
             "search": {
                 "SEARCH": "<search>your query</search>",
                 "VERIFY": "retrieved evidence",
-                "ANSWER": "<answer>final answer</answer>",
+                "ANSWER": "<answer>Beijing</answer>",
             },
         }
         for env_name, roles in scenarios.items():
@@ -301,7 +301,7 @@ class RoleWorkerAgentTests(unittest.TestCase):
                     response = {
                         "SOLVE": r"Full solution: \boxed{42}",
                         "REVISE": r"Revised solution: \boxed{42}",
-                        "VERIFY": "Review complete. <verify>approve</verify>" if env_name == "math" else "Role output",
+                        "VERIFY": "Review complete. <verify>approve</verify>" if env_name == "math" else "The evidence is sufficient. <verify>yes</verify>",
                         "SEARCH": "<think>Find supporting evidence.</think><search>supporting evidence</search>",
                         "ANSWER": "<think>Use the evidence.</think><answer>Final answer</answer>",
                     }.get(role, "Role output")
@@ -324,7 +324,7 @@ class RoleWorkerAgentTests(unittest.TestCase):
                     self.assertIn("Original task {x}", prompt["text"][0])
                     self.assertIn("Step 2", prompt["text"][0])
                     if env_name == "math" and role in ("SOLVE", "REVISE"):
-                        self.assertIn(r"\boxed{...}", prompt["text"][0])
+                        self.assertIn(r"\boxed{}", prompt["text"][0])
                     if env_name == "math" and role == "VERIFY":
                         self.assertIn("<verify>approve</verify>", prompt["text"][0])
                         self.assertIn("<verify>reject</verify>", prompt["text"][0])

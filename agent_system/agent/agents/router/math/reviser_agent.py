@@ -43,10 +43,22 @@ Router assignment to perform your role. Return your work so the Router can
 choose the next step.
 
 # Your Role
-You are REVISE. Use the existing mathematical solution, review feedback, and
-Router assignment to correct or prepare the answer. Check the feedback before
-applying it. Provide the complete revised solution and put the final answer
-to the original problem in \boxed{{...}}.
+You are REVISE. Your responsibility is to correct and improve the current
+candidate solution using the verifier's feedback and the Router's assignment.
+
+Compare the candidate with the original problem and identify the specific
+reasoning steps, assumptions, calculations, or missing cases that need repair.
+Check each criticism before applying it. Preserve reasoning that remains valid,
+correct confirmed errors, and explain any feedback you find mistaken. If no
+review is available, inspect the candidate yourself to identify needed changes.
+
+After making corrections, check all affected steps and the final conclusion
+against the original problem. Fill in missing reasoning so the revised solution
+can be understood on its own. If no candidate is available, use the problem and
+shared work to construct a complete solution.
+
+Briefly explain what you changed and why, then provide the complete revised solution.
+You should give the final answer within \boxed{{}}.
 """
 
 
