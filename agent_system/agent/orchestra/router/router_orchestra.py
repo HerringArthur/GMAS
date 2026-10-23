@@ -28,10 +28,14 @@ Agent contract:
   exact configured role name or ``FINISH``, and marks other selections invalid
   through ``is_action_valid``. Its text contains any assignment
   instructions, which are passed to the selected role through team_context.
-* SubAgent uses its role name/configuration to select its prompt. SEARCH validates
-  a single nonempty search request; other roles check for nonempty responses.
-  It supplies an empty ``selected_role`` field. This module does not parse
-  model-generated tags. All valid role responses update team_context. Only
+* Each role has its own agent class and prompt. VERIFY is selected by scene.
+  SEARCH and ANSWER use the shared general_projection checks and return only
+  the tagged search request or answer. Math SOLVE/REVISE use math_projection;
+  math VERIFY checks verify tags with general_projection. All math roles
+  preserve complete responses. Search VERIFY checks for nonempty responses.
+  Role agents supply an empty ``selected_role`` field.
+  This module does not parse model-generated tags.
+  All valid role responses update team_context. Only
   SOLVE/REVISE in math and SEARCH/ANSWER in search update text_actions. Answer
   roles also save candidate_answers, which FINISH copies into text_actions.
   A valid SEARCH response in the search scene pauses that sample for environment execution.

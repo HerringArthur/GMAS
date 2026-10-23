@@ -1,6 +1,6 @@
 """Exercise the new Orchestra contract with scripted agents, without model loading.
 
-Real RouterAgent/SubAgent integration is covered by test_role_router_agent.py.
+Real RouterAgent and role-agent integration is covered by test_role_router_agent.py.
 Run: python3 -m unittest discover -s tests/agent_system -p 'test_role_router_orchestra.py' -v
 """
 

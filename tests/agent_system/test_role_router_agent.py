@@ -1,6 +1,8 @@
 """Test role agents and routing with mocked preprocessing and model generation."""
 
+import ast
 import importlib.util
+import re
 import sys
 import unittest
 from collections import deque
@@ -32,6 +34,22 @@ def load_agents():
         spec.loader.exec_module(result)
         return result
 
+    # Execute the real projections and answer extraction without importing
+    # unrelated grading dependencies.
+    projection_module = module("agent_system.agent.utils", np=np, re=re, List=list, Tuple=tuple)
+    for relative_path, function_names in (
+        ("agent_system/environments/env_package/math/utils.py",
+         {"last_boxed_only_string", "remove_boxed", "extract_boxed_answer", "extract_answer"}),
+        ("agent_system/agent/utils.py", {"general_projection", "math_projection"}),
+    ):
+        projection_path = ROOT / relative_path
+        functions = [
+            node for node in ast.parse(projection_path.read_text()).body
+            if isinstance(node, ast.FunctionDef) and node.name in function_names
+        ]
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(projection_path), "exec"),
+             projection_module.__dict__)
+
     stubs = {
         "transformers": module("transformers", PreTrainedTokenizer=object),
         "verl": module("verl", DataProto=object),
@@ -44,19 +62,29 @@ def load_agents():
         "agent_system.multi_turn_rollout.utils": module(
             "agent_system.multi_turn_rollout.utils", preprocess_batch=unused,
         ),
+        "agent_system.agent.utils": projection_module,
     }
     with patch.dict(sys.modules, stubs):
         registry = load("agent_system.agent.registry", "agent_system/agent/registry.py")
         load("agent_system.agent.agents.base", "agent_system/agent/agents/base.py")
         router = load("agent_system.agent.agents.router.router_agent", "agent_system/agent/agents/router/router_agent.py")
-        subagent = load("agent_system.agent.agents.router.subagent", "agent_system/agent/agents/router/subagent.py")
+        role_modules = {}
+        for scene, role_files in {
+            "math": {"SOLVE": "solver_agent", "VERIFY": "verifier_agent", "REVISE": "reviser_agent"},
+            "search": {"SEARCH": "search_agent", "VERIFY": "verifier_agent", "ANSWER": "answer_agent"},
+        }.items():
+            role_modules[scene] = {
+                role: load(f"agent_system.agent.agents.router.{scene}.{filename}",
+                           f"agent_system/agent/agents/router/{scene}/{filename}.py")
+                for role, filename in role_files.items()
+            }
         package = load("agent_system.agent.agents.router", "agent_system/agent/agents/router/__init__.py")
         load("agent_system.agent.orchestra.base", "agent_system/agent/orchestra/base.py")
         orchestra = load("role_agents_orchestra_under_test", "agent_system/agent/orchestra/router/router_orchestra.py")
-    return router, subagent, package, registry.AgentRegistry, orchestra.RouterMultiAgentOrchestra
+    return router, role_modules, package, registry.AgentRegistry, orchestra.RouterMultiAgentOrchestra
 
 
-router_module, subagent_module, router_package, AgentRegistry, RouterOrchestra = load_agents()
+router_module, role_modules, router_package, AgentRegistry, RouterOrchestra = load_agents()
 
 
 class RoleRouterAgentTests(unittest.TestCase):
@@ -207,7 +235,24 @@ class RoleRouterAgentTests(unittest.TestCase):
                 )
 
 
-class RoleSubAgentTests(unittest.TestCase):
+class RoleWorkerAgentTests(unittest.TestCase):
+    def test_scene_specific_verifiers_keep_independent_classes_and_worker_bindings(self):
+        agents = []
+        for scene, wg_id in (("math", "math-verify"), ("search", "search-verify"), ("math", "second-math-verify")):
+            agent = AgentRegistry.create(
+                "VERIFY", wg_id=wg_id, tokenizer=None, processor=None,
+                config=SimpleNamespace(env=SimpleNamespace(env_name=scene)),
+            )
+            self.assertIsInstance(agent, role_modules[scene]["VERIFY"].VerifierAgent)
+            self.assertEqual(agent.name, "VERIFY")
+            self.assertEqual(agent.wg_id, wg_id)
+            agents.append(agent)
+        self.assertIsNot(type(agents[0]), type(agents[1]))
+        self.assertIs(type(agents[0]), type(agents[2]))
+        self.assertIn("mathematical solution", agents[0].prompt)
+        self.assertIn("retrieved evidence", agents[1].prompt)
+        self.assertEqual(agents[0].prompt, agents[2].prompt)
+
     def test_registered_roles_receive_scene_prompts_and_shared_assignment(self):
         scenarios = {
             "math": {
@@ -232,15 +277,22 @@ class RoleSubAgentTests(unittest.TestCase):
                     context = ['The output of "Router Agent": <think>Check the evidence.</think>']
                     candidate = r"Candidate with full reasoning and \boxed{42}"
                     batch = SimpleNamespace(non_tensor_batch={})
-                    response = "<search>supporting evidence</search>" if role == "SEARCH" else "Role output"
-                    with patch.object(subagent_module, "preprocess_batch", return_value=batch) as preprocess:
+                    response = {
+                        "SOLVE": r"Full solution: \boxed{42}",
+                        "REVISE": r"Revised solution: \boxed{42}",
+                        "VERIFY": "Review complete. <verify>approve</verify>" if env_name == "math" else "Role output",
+                        "SEARCH": "<think>Find supporting evidence.</think><search>supporting evidence</search>",
+                        "ANSWER": "<think>Use the evidence.</think><answer>Final answer</answer>",
+                    }.get(role, "Role output")
+                    agent_module = role_modules[env_name][role]
+                    with patch.object(agent_module, "preprocess_batch", return_value=batch) as preprocess:
                         with patch.object(agent, "_generate_with_llm", return_value=(batch, [response])):
                             agent.call(
                                 SimpleNamespace(meta_info={}), observation, context,
                                 object(), np.array([True]), step=2, candidate_answers=[candidate],
                             )
                     prompt = preprocess.call_args.kwargs["obs"]
-                    self.assertIsInstance(agent, subagent_module.SubAgent)
+                    self.assertEqual(type(agent).__module__, agent_module.__name__)
                     self.assertEqual(agent.name, role)
                     self.assertEqual(agent.wg_id, f"policy:{role}")
                     self.assertIn(f"You are {role}.", prompt["text"][0])
@@ -252,71 +304,199 @@ class RoleSubAgentTests(unittest.TestCase):
                     self.assertIn("Step 2", prompt["text"][0])
                     if env_name == "math" and role in ("SOLVE", "REVISE"):
                         self.assertIn(r"\boxed{...}", prompt["text"][0])
+                    if env_name == "math" and role == "VERIFY":
+                        self.assertIn("<verify>approve</verify>", prompt["text"][0])
+                        self.assertIn("<verify>reject</verify>", prompt["text"][0])
                     self.assertEqual(observation["text"], ["Original task {x}"])
                     self.assertEqual(prompt["image"], observation["image"])
 
-    def test_call_preserves_responses_and_excludes_empty_and_inactive_rows(self):
+    def test_math_answer_roles_check_boxed_answers_and_preserve_full_solutions(self):
+        for role in ("SOLVE", "REVISE"):
+            with self.subTest(role=role):
+                wg_id = f"math:{role}"
+                agent = AgentRegistry.create(
+                    role, wg_id=wg_id, tokenizer=None, processor=None,
+                    config=SimpleNamespace(env=SimpleNamespace(env_name="math")),
+                )
+                responses = [
+                    r"Full derivation ending in \boxed{\frac{1}{2}}",
+                    " \n ",
+                    r"Inactive solution: \boxed{3}",
+                    "Partial derivation without a boxed answer",
+                    r"Unfinished answer: \boxed{\frac{1}{2}",
+                    r"<think>Full derivation.</think>\boxed{4}",
+                    r"Empty answer: \boxed{}",
+                    r"First \boxed{1}, then an unfinished correction \boxed{2",
+                ]
+                size = len(responses)
+                mask = np.array([True, True, False, True, True, True, True, True])
+                raw_generation = tuple(responses)
+                batch = SimpleNamespace(
+                    batch={"responses": raw_generation},
+                    non_tensor_batch={"wg_id": np.full(size, wg_id, dtype=object), "agent_active_mask": mask},
+                )
+                gen_batch = SimpleNamespace(meta_info={})
+                group = object()
+                with patch.object(role_modules["math"][role], "preprocess_batch", return_value=batch) as preprocess:
+                    with patch.object(agent, "_generate_with_llm", return_value=(batch, responses)) as generate:
+                        returned_batch, returned_responses = agent.call(
+                            gen_batch, {"text": ["Problem"] * size}, [""] * size, group, mask,
+                            step=2, candidate_answers=[""] * size,
+                        )
+                generate.assert_called_once_with(batch, group, mask, gen_batch.meta_info)
+                self.assertIs(preprocess.call_args.kwargs["agent_active_mask"], mask)
+                self.assertIs(returned_batch, batch)
+                self.assertIs(batch.batch["responses"], raw_generation)
+                self.assertEqual(returned_responses, list(raw_generation))
+                self.assertIs(batch.non_tensor_batch["agent_active_mask"], mask)
+                self.assertEqual(batch.non_tensor_batch["wg_id"].tolist(), [wg_id] * size)
+                self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(),
+                                 [True, False, False, False, False, True, True, False])
+                self.assertEqual(batch.non_tensor_batch["selected_role"].tolist(), [""] * size)
+                self.assertEqual(batch.non_tensor_batch["env_step"].tolist(), [2] * size)
+
+    def test_math_verifier_checks_tags_and_preserves_full_reports(self):
         agent = AgentRegistry.create(
-            "VERIFY", wg_id="verify-policy", tokenizer=None, processor=None,
+            "VERIFY", wg_id="math-verify-policy", tokenizer=None, processor=None,
             config=SimpleNamespace(env=SimpleNamespace(env_name="math")),
         )
-        responses = ["The second step has an error.", " \n ", "inactive report", ""]
-        mask = np.array([True, True, False, True])
-        raw_tokens = object()
-        batch = SimpleNamespace(
-            batch={"responses": raw_tokens},
-            non_tensor_batch={"wg_id": np.full(4, "verify-policy", dtype=object), "agent_active_mask": mask},
-        )
-        gen_batch = SimpleNamespace(meta_info={})
-        group = object()
-        candidates = [r"First derivation: \boxed{1}", "Second candidate", "Inactive candidate", ""]
-        with patch.object(subagent_module, "preprocess_batch", return_value=batch) as preprocess:
-            with patch.object(agent, "_generate_with_llm", return_value=(batch, responses)) as generate:
+        responses = [
+            "All steps are correct. <verify> approve </verify>",
+            "<think>A root is missing.</think><verify>reject</verify>",
+            "A root is missing, but there is no verdict tag.",
+            "Unclosed verdict: <verify>reject",
+            "答案正确。<verify>approve</verify>",
+            "Unspecified verdict. <verify>uncertain</verify>",
+            "Inactive report. <verify>approve</verify>",
+        ]
+        expected = responses.copy()
+        expected[0] = "All steps are correct. <verify>approve</verify>"
+        size = len(responses)
+        mask = np.array([True] * (size - 1) + [False])
+        raw_generation = tuple(responses)
+        batch = SimpleNamespace(batch={"responses": raw_generation}, non_tensor_batch={})
+        with patch.object(role_modules["math"]["VERIFY"], "preprocess_batch", return_value=batch):
+            with patch.object(agent, "_generate_with_llm", return_value=(batch, responses)):
                 returned_batch, returned_responses = agent.call(
-                    gen_batch, {"text": ["Problem"] * 4}, ["shared work"] * 4, group, mask, step=1,
-                    candidate_answers=candidates,
+                    SimpleNamespace(meta_info={}), {"text": ["Problem"] * size}, [""] * size,
+                    object(), mask, step=1, candidate_answers=[""] * size,
                 )
-        generate.assert_called_once_with(batch, group, mask, gen_batch.meta_info)
-        self.assertIs(preprocess.call_args.kwargs["agent_active_mask"], mask)
         self.assertIs(returned_batch, batch)
-        self.assertIs(returned_responses, responses)
-        self.assertIs(batch.batch["responses"], raw_tokens)
-        self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(), [True, False, False, False])
-        self.assertEqual(batch.non_tensor_batch["selected_role"].tolist(), [""] * 4)
-        self.assertEqual(batch.non_tensor_batch["env_step"].tolist(), [1] * 4)
-        prompts = preprocess.call_args.kwargs["obs"]["text"]
-        self.assertIn(candidates[0], prompts[0])
-        self.assertNotIn(candidates[1], prompts[0])
-        self.assertIn(candidates[1], prompts[1])
-        self.assertNotIn(candidates[0], prompts[1])
-        self.assertIn("No candidate answer has been generated yet.", prompts[3])
+        self.assertIs(batch.batch["responses"], raw_generation)
+        self.assertEqual(returned_responses, expected)
+        self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(),
+                         [True, True, False, False, False, True, False])
 
-    def test_search_requires_one_nonempty_request_and_preserves_generated_text(self):
+    def test_call_preserves_responses_and_excludes_empty_and_inactive_rows(self):
+        for scene, role in (("math", "VERIFY"), ("math", "REVISE"), ("search", "VERIFY")):
+            with self.subTest(scene=scene, role=role):
+                wg_id = f"{scene}:{role}"
+                agent = AgentRegistry.create(
+                    role, wg_id=wg_id, tokenizer=None, processor=None,
+                    config=SimpleNamespace(env=SimpleNamespace(env_name=scene)),
+                )
+                response = {
+                    ("math", "VERIFY"): "The second step has an error. <verify>reject</verify>",
+                    ("math", "REVISE"): r"Correcting the second step gives \boxed{2}",
+                }.get((scene, role), "The second step has an error.")
+                responses = [response, " \n ", response, ""]
+                mask = np.array([True, True, False, True])
+                raw_tokens = object()
+                batch = SimpleNamespace(
+                    batch={"responses": raw_tokens},
+                    non_tensor_batch={"wg_id": np.full(4, wg_id, dtype=object), "agent_active_mask": mask},
+                )
+                gen_batch = SimpleNamespace(meta_info={})
+                group = object()
+                candidates = [r"First derivation: \boxed{1}", "Second candidate", "Inactive candidate", ""]
+                with patch.object(role_modules[scene][role], "preprocess_batch", return_value=batch) as preprocess:
+                    with patch.object(agent, "_generate_with_llm", return_value=(batch, responses)) as generate:
+                        returned_batch, returned_responses = agent.call(
+                            gen_batch, {"text": ["Problem"] * 4}, ["shared work"] * 4, group, mask, step=1,
+                            candidate_answers=candidates,
+                        )
+                generate.assert_called_once_with(batch, group, mask, gen_batch.meta_info)
+                self.assertIs(preprocess.call_args.kwargs["agent_active_mask"], mask)
+                self.assertIs(returned_batch, batch)
+                self.assertIs(returned_responses, responses)
+                self.assertIs(batch.batch["responses"], raw_tokens)
+                self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(), [True, False, False, False])
+                self.assertEqual(batch.non_tensor_batch["selected_role"].tolist(), [""] * 4)
+                self.assertEqual(batch.non_tensor_batch["env_step"].tolist(), [1] * 4)
+                prompts = preprocess.call_args.kwargs["obs"]["text"]
+                self.assertIn(candidates[0], prompts[0])
+                self.assertNotIn(candidates[1], prompts[0])
+                self.assertIn(candidates[1], prompts[1])
+                self.assertNotIn(candidates[0], prompts[1])
+                self.assertIn("No candidate answer has been generated yet.", prompts[3])
+
+    def test_answer_uses_drmas_projection_and_preserves_raw_generation(self):
+        agent = AgentRegistry.create(
+            "ANSWER", wg_id="answer-policy", tokenizer=None, processor=None,
+            config=SimpleNamespace(env=SimpleNamespace(env_name="search")),
+        )
+        responses = [
+            "<think>Use the evidence.</think><answer> Beijing </answer>",
+            "<answer>Beijing</answer>",
+            "<think>Use the evidence.</think>Beijing",
+            "<think>Use the evidence.</think><answer>北京</answer>",
+            "<think>Use the evidence.</think><answer></answer>",
+            "<think>Use the evidence.</think><answer>First</answer><answer>Second</answer>",
+            "<think><answer>Inside thought</answer></think>",
+            "<think>Use the evidence.</think></answer><answer>Reversed",
+            "<think>One</think><think>Two</think><answer>Beijing</answer>",
+            "<think>Inactive</think><answer>Beijing</answer>",
+        ]
+        expected = [
+            "<answer>Beijing</answer>", "<answer>Beijing</answer>", "", "<answer>北京</answer>",
+            "<answer></answer>", "<answer>First</answer>", "<answer>Inside thought</answer>",
+            "<answer></answer>", "<answer>Beijing</answer>", "<answer>Beijing</answer>",
+        ]
+        size = len(responses)
+        mask = np.array([True] * (size - 1) + [False])
+        raw_generation = tuple(responses)
+        batch = SimpleNamespace(batch={"responses": raw_generation}, non_tensor_batch={})
+        with patch.object(role_modules["search"]["ANSWER"], "preprocess_batch", return_value=batch):
+            with patch.object(agent, "_generate_with_llm", return_value=(batch, responses)):
+                returned_batch, returned_responses = agent.call(
+                    SimpleNamespace(meta_info={}), {"text": ["Question"] * size}, [""] * size,
+                    object(), mask, step=1, candidate_answers=[""] * size,
+                )
+        self.assertIs(returned_batch, batch)
+        self.assertIs(batch.batch["responses"], raw_generation)
+        self.assertEqual(returned_responses, expected)
+        self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(),
+                         [True, False, False, False, True, True, True, True, False, False])
+
+    def test_search_uses_drmas_projection_and_preserves_raw_generation(self):
         agent = AgentRegistry.create(
             "SEARCH", wg_id="search-policy", tokenizer=None, processor=None,
             config=SimpleNamespace(env=SimpleNamespace(env_name="search")),
         )
         responses = [
-            "<search>first query</search>",
             " \n<think>Find supporting evidence.</think>\n<search> second query </search>\n",
-            "",
+            "<search>first query</search>",
             "plain text without a search request",
-            "<search></search>",
-            "<search> \n </search>",
-            "<search>unfinished",
-            "<search>first</search><search>second</search>",
-            "<search>query</search> extra",
-            "<answer>final answer</answer>",
+            "<think>Find supporting evidence.</think><search>北京</search>",
+            "<think>Find supporting evidence.</think><search> \n </search>",
+            "<think>Find supporting evidence.</think><search>unfinished",
+            "<think>Find supporting evidence.</think><search>first</search><search>second</search>",
             "<think><search>quoted query</search></think><search>actual query</search>",
             "<think><answer>premature answer</answer></think><search>query</search>",
-            "<search><search>nested</search></search>",
-            "<search>inactive query</search>",
+            "<think>One</think><think>Two</think><search>query</search>",
+            "<think>Inactive</think><search>inactive query</search>",
+        ]
+        expected = [
+            "<search>second query</search>", "<search>first query</search>", "",
+            "<search>北京</search>", "<search></search>", "", "<search>first</search>",
+            "<search>quoted query</search>", "<search>query</search>",
+            "<search>query</search>", "<search>inactive query</search>",
         ]
         size = len(responses)
         mask = np.array([True] * (size - 1) + [False])
-        raw_tokens = object()
-        batch = SimpleNamespace(batch={"responses": raw_tokens}, non_tensor_batch={})
-        with patch.object(subagent_module, "preprocess_batch", return_value=batch):
+        raw_generation = tuple(responses)
+        batch = SimpleNamespace(batch={"responses": raw_generation}, non_tensor_batch={})
+        with patch.object(role_modules["search"]["SEARCH"], "preprocess_batch", return_value=batch):
             with patch.object(agent, "_generate_with_llm", return_value=(batch, responses)):
                 returned_batch, returned_responses = agent.call(
                     SimpleNamespace(meta_info={}), {"text": ["Question"] * size},
@@ -324,9 +504,10 @@ class RoleSubAgentTests(unittest.TestCase):
                     candidate_answers=[""] * size,
                 )
         self.assertIs(returned_batch, batch)
-        self.assertIs(returned_responses, responses)
-        self.assertIs(batch.batch["responses"], raw_tokens)
-        self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(), [True, True] + [False] * (size - 2))
+        self.assertIs(batch.batch["responses"], raw_generation)
+        self.assertEqual(returned_responses, expected)
+        self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(),
+                         [True, False, False, False, True, False, True, True, True, False, False])
 
     def test_orchestra_dispatches_real_agents_with_role_prompts_and_model_groups(self):
         for env_name, roles in (("math", ["SOLVE", "VERIFY", "REVISE"]),
@@ -347,7 +528,12 @@ class RoleSubAgentTests(unittest.TestCase):
                     )
                 self.assertEqual(list(orchestra.agents), names)
                 instruction = f"<think>Perform the assigned task.</think><route>{roles[0]}</route>"
-                first_output = "<search>first query</search>" if env_name == "search" else "first output"
+                first_output = "<search>first query</search>" if env_name == "search" else r"first output: full derivation, \boxed{1}"
+                first_response = "<think>Search-only reasoning.</think>" + first_output if env_name == "search" else first_output
+                final_action = "<answer>final output</answer>" if env_name == "search" else r"final output: corrected derivation, \boxed{2}"
+                final_response = "<think>Answer-only reasoning.</think>" + final_action if env_name == "search" else final_action
+                review = "review <verify>reject</verify>" if env_name == "math" else "review"
+                final_review = "final review <verify>approve</verify>" if env_name == "math" else "final review"
                 scripts = {
                     "Router Agent": deque([
                         [instruction, "<route>VERIFY</route>"],
@@ -355,9 +541,9 @@ class RoleSubAgentTests(unittest.TestCase):
                         ["<route>VERIFY</route>", f"<route>{roles[0]}</route>"],
                         ["<route>FINISH</route>", f"<route>{roles[0]}</route>"],
                     ]),
-                    roles[0]: deque([[first_output, "ignored"]]),
-                    "VERIFY": deque([["ignored", "review"], ["final review", "ignored"]]),
-                    roles[2]: deque([["final output", "ignored"]]),
+                    roles[0]: deque([[first_response, "ignored"]]),
+                    "VERIFY": deque([["ignored", review], [final_review, "ignored"]]),
+                    roles[2]: deque([[final_response, "ignored"]]),
                 }
                 prompts = []
 
@@ -375,12 +561,16 @@ class RoleSubAgentTests(unittest.TestCase):
 
                 with ExitStack() as stack:
                     stack.enter_context(patch.object(router_module, "preprocess_batch", side_effect=preprocess))
-                    stack.enter_context(patch.object(subagent_module, "preprocess_batch", side_effect=preprocess))
+                    for agent_module in role_modules[env_name].values():
+                        stack.enter_context(patch.object(agent_module, "preprocess_batch", side_effect=preprocess))
                     for name, agent in orchestra.agents.items():
                         stack.enter_context(patch.object(agent, "_generate_with_llm", side_effect=partial(generate, name)))
                     inputs = (SimpleNamespace(meta_info={}), {"text": ["A task", "B task"]}, groups, np.ones(2, dtype=bool), 1)
                     actions, buffer = orchestra.run(*inputs)
                     self.assertEqual(actions, [first_output, ""])
+                    self.assertEqual(buffer[1]["batch"].batch["responses"], (first_response, "ignored"))
+                    self.assertIn(first_output, "".join(orchestra.team_context[0]))
+                    self.assertNotIn("Search-only reasoning.", "".join(orchestra.team_context[0]))
                     self.assertIn("review", "".join(orchestra.team_context[1]))
                     self.assertIn(f"You are {roles[0]}.", prompts[1][0])
                     self.assertIn(instruction, prompts[1][0])
@@ -407,9 +597,12 @@ class RoleSubAgentTests(unittest.TestCase):
                         ])
                         other_action, other_reason = "", ""
                     prompt_start = len(prompts)
-                    actions, _ = orchestra.run(*inputs)
-                    self.assertEqual(actions, ["final output", other_action])
-                    self.assertEqual(orchestra.candidate_answers, ["final output", ""])
+                    actions, answer_buffer = orchestra.run(*inputs)
+                    self.assertEqual(actions, [final_action, other_action])
+                    self.assertEqual(orchestra.candidate_answers, [final_action, ""])
+                    self.assertEqual(answer_buffer[-1]["batch"].batch["responses"], (final_response, "ignored"))
+                    self.assertIn(final_action, "".join(orchestra.team_context[0]))
+                    self.assertNotIn("Answer-only reasoning.", "".join(orchestra.team_context[0]))
                     self.assertIn("retrieved evidence" if env_name == "search" else first_output, prompts[prompt_start][0])
                     self.assertIn(first_output, prompts[prompt_start][0])
                     self.assertIn(instruction, prompts[prompt_start][0])
@@ -418,14 +611,15 @@ class RoleSubAgentTests(unittest.TestCase):
                     # The review evicts the answer's original run. The next
                     # Router must still see it through the candidate section.
                     actions, _ = orchestra.run(*inputs)
-                    self.assertEqual(actions, ["final output", other_action])
+                    self.assertEqual(actions, [final_action, other_action])
                     self.assertNotIn("final output", "".join(orchestra.team_context[0]))
                     self.assertIn("final review", "".join(orchestra.team_context[0]))
                     prompt_start = len(prompts)
                     actions, _ = orchestra.run(*inputs)
-                    self.assertEqual(actions, ["final output", other_action])
+                    self.assertEqual(actions, [final_action, other_action])
                     self.assertIn("# Current Candidate Answer", prompts[prompt_start][0])
-                    self.assertIn("final output", prompts[prompt_start][0])
+                    self.assertIn(final_action, prompts[prompt_start][0])
+                    self.assertNotIn("Answer-only reasoning.", prompts[prompt_start][0])
                     self.assertNotIn("final output", prompts[prompt_start][1])
                     self.assertEqual(orchestra.return_reasons.tolist(), ["finish", other_reason])
                     self.assertTrue(all(not script for script in scripts.values()))

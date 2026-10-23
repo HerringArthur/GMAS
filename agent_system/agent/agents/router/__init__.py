@@ -13,19 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
-
 from agent_system.agent.registry import AgentRegistry
 
 from .router_agent import RouterAgent
-from .subagent import SubAgent
+from .math import SolverAgent, ReviserAgent, VerifierAgent as MathVerifierAgent
+from .search import SearchAgent, AnswerAgent, VerifierAgent as SearchVerifierAgent
 
-# Register the shared implementation under each role name. Orchestra creates
-# only the roles enabled in the current scene's configuration.
-for role in ("SOLVE", "VERIFY", "REVISE", "SEARCH", "ANSWER"):
-    AgentRegistry.register(role)(partial(SubAgent, name=role))
+
+@AgentRegistry.register("VERIFY")
+def create_verifier_agent(wg_id, tokenizer, processor, config):
+    """Keep one Router role name while selecting the scene's verifier class."""
+    verifier_class = {"math": MathVerifierAgent, "search": SearchVerifierAgent}[config.env.env_name]
+    return verifier_class(wg_id=wg_id, tokenizer=tokenizer, processor=processor, config=config)
+
 
 __all__ = [
     "RouterAgent",
-    "SubAgent",
+    "SolverAgent",
+    "MathVerifierAgent",
+    "ReviserAgent",
+    "SearchAgent",
+    "SearchVerifierAgent",
+    "AnswerAgent",
 ]
