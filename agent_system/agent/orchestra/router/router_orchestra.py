@@ -35,6 +35,8 @@ Agent contract:
   preserve complete responses. Search VERIFY checks for nonempty responses.
   Role agents supply an empty ``selected_role`` field.
   This module does not parse model-generated tags.
+  Orchestra attaches ``parent_prefix_key`` to each batch for Router credit.
+  Role credit uses the task and role identity, independently of this prefix.
   All valid role responses update team_context. Only
   SOLVE/REVISE in math and SEARCH/ANSWER in search update text_actions. Answer
   roles also save candidate_answers, which FINISH copies into text_actions.
@@ -51,8 +53,8 @@ Example configuration, alongside a matching agent-to-worker-group mapping::
           max_loop_num: 4
           max_context_runs: 2
 
-Role prompts belong to the agents. Further role-output validation and
-credit-assignment metadata are deferred.
+Role prompts and output validation belong to the agents. Credit is computed
+in the trainer from collected trajectory rewards and routing metadata.
 """
 
 import importlib
@@ -120,6 +122,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
     retains its latest max_context_runs completed runs across environment steps.
     During a run, the selected role also sees the current Router assignment.
     Candidate answers persist independently until reset() starts a new rollout.
+    Role paths also persist for Router credit, independently of history eviction.
     initialize_context() clears pending actions and return reasons for each
     environment step. FINISH and valid SEARCH responses mark samples ready for
     the next environment interaction.
@@ -153,6 +156,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.text_actions = None
         self.candidate_answers = None
         self.return_reasons = None
+        self.role_paths = None
 
     def reset(self):
         super().reset()
@@ -160,6 +164,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.text_actions = None
         self.candidate_answers = None
         self.return_reasons = None
+        self.role_paths = None
 
     def initialize_context(self, env_obs):
         """Start an environment step, retaining team context and candidate answers."""
@@ -168,6 +173,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             self.team_context = [[] for _ in text_actions]
         if self.candidate_answers is None:
             self.candidate_answers = [""] * len(text_actions)
+        if self.role_paths is None:
+            self.role_paths = [()] * len(text_actions)
         self.text_actions = text_actions
         self.return_reasons = np.full(len(self.text_actions), "", dtype=object)
         return self.text_actions, ["".join(runs) for runs in self.team_context], env_obs
@@ -202,6 +209,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         selections = router_batch.non_tensor_batch["selected_role"]
         finish_mask = selections == self.FINISH
         route_mask = pending_mask & router_batch.non_tensor_batch["is_action_valid"]
+        parent_prefix_keys = np.fromiter(self.role_paths, dtype=object, count=len(self.role_paths))
+        router_batch.non_tensor_batch["parent_prefix_key"] = parent_prefix_keys
         self.team_context = update_team_context(
             self.ROUTER_AGENT, self.team_context,
             np.where(route_mask, router_responses, "").tolist(),
@@ -235,6 +244,11 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                 agent_active_mask=role_mask,
                 step=step,
             )
+            # Every actual role call advances the path, even if its output is
+            # invalid. FINISH and invalid Router attempts do not append a role.
+            for i in np.flatnonzero(role_mask):
+                self.role_paths[i] += (role,)
+            batch.non_tensor_batch["parent_prefix_key"] = parent_prefix_keys.copy()
             valid_mask = role_mask & batch.non_tensor_batch["is_action_valid"]
             self.team_context = update_team_context(
                 role, self.team_context, responses, valid_mask,

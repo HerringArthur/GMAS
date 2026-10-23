@@ -45,7 +45,7 @@ class TrainingBenchmark:
 
     STAGES = ("gen", "old_log_prob", "reward", "adv", "update_actor", "dump_rollout_samples")
     TURN_FIELDS = (
-        "agent_id", "wg_id", "env_step", "selected_agent", "handoff_decision",
+        "agent_id", "wg_id", "env_step", "selected_role", "selected_agent", "handoff_decision",
         "is_action_valid", "agent_path", "prefix_key", "parent_prefix_key",
         "routed_agent", "routing_instruction", "router_feedback", "return_reason",
         "candidate_answer", "candidate_author", "candidate_repeat_count", "candidate_evidence",

@@ -273,8 +273,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         multi_turn (bool, optional): Whether the data is from a multi-turn conversation. Defaults to False.
         norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in GRPO. Defaults to True.
         credit_mode (str, optional): Advantage mode for GRPO. ``standard`` uses
-            the existing GRPO grouping; ``router_subagent`` uses the empirical
-            Router/SubAgent credit tables.
+            the existing GRPO grouping; ``router_subagent`` compares Router
+            choices by task/prefix and role outputs by task/role.
 
     Returns:
         DataProto: The updated data with computed advantages and returns.

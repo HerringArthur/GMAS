@@ -41,7 +41,7 @@ fi
 ###################### Algorithm Configurations #################
 algorithm=grpo
 group_size=8
-group_by_agent_id=False # GMAS groups by worker prefix / Router node instead.
+group_by_agent_id=False # Custom credit groups roles by task/role and Router choices by task/prefix.
 credit_mode=router_subagent
 norm_adv_by_std_in_grpo=True
 # Match the DrMAS default; when enabled, KL is a separate token-level penalty.

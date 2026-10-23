@@ -182,6 +182,39 @@ class RoleRouterTests(unittest.TestCase):
         )
         return actions, list(buffer)
 
+    def test_credit_paths_track_actual_calls_and_survive_history_eviction(self):
+        orchestra = self.make_orchestra(context_runs=1)
+        self.route(["SOLVE", "VERIFY", "SOLVE"])
+        self.respond("SOLVE", ["solution", "ignored", "inactive"])
+        self.respond("VERIFY", ["ignored", "invalid review", "inactive"], valid=[True, False, True])
+        _, first = self.run_round(active=(True, True, False))
+        self.assertEqual(orchestra.role_paths, [("SOLVE",), ("VERIFY",), ()])
+        for entry in first:
+            paths = entry["batch"].non_tensor_batch["parent_prefix_key"]
+            self.assertEqual(paths.shape, (3,))
+            self.assertEqual(paths.tolist(), [(), (), ()])
+
+        self.route(["UNKNOWN", "SOLVE", "SOLVE"], valid=[False, True, True])
+        self.respond("SOLVE", ["ignored", "solution", "inactive"])
+        _, second = self.run_round(active=(True, True, False))
+        self.assertEqual(orchestra.role_paths, [("SOLVE",), ("VERIFY", "SOLVE"), ()])
+        self.assertEqual(second[0]["batch"].non_tensor_batch["parent_prefix_key"].tolist(),
+                         [("SOLVE",), ("VERIFY",), ()])
+
+        orchestra.initialize_context({"text": ["next step"] * 3})
+        self.route(["FINISH", "SOLVE", "SOLVE"])
+        self.respond("SOLVE", ["ignored", "revised", "inactive"])
+        _, third = self.run_round(active=(True, True, False), step=2)
+        self.assertEqual(third[0]["batch"].non_tensor_batch["parent_prefix_key"].tolist(),
+                         [("SOLVE",), ("VERIFY", "SOLVE"), ()])
+        self.assertEqual(orchestra.role_paths, [("SOLVE",), ("VERIFY", "SOLVE", "SOLVE"), ()])
+        self.assertEqual(len(orchestra.team_context[1]), 1)
+        self.assertEqual(first[0]["batch"].non_tensor_batch["parent_prefix_key"].tolist(), [(), (), ()])
+        orchestra.reset()
+        self.assertIsNone(orchestra.role_paths)
+        orchestra.initialize_context({"text": ["new rollout"] * 3})
+        self.assertEqual(orchestra.role_paths, [(), (), ()])
+
     def collect(self, environment):
         collector = SimpleNamespace(config=self.config, multiagent_orchestra=self.orchestra)
         batch = FakeBatch(len(environment.observations))
@@ -474,6 +507,9 @@ class RoleRouterTests(unittest.TestCase):
         self.assertEqual(lengths.tolist(), [2.0, 1.0])
         self.assertEqual(rewards.tolist(), [1.0, 1.0])
         self.assertFalse(rows[0][2]["is_action_valid"])
+        self.assertEqual([row["parent_prefix_key"] for row in rows[0]],
+                         [(), (), ("SEARCH",), ("SEARCH",), ("SEARCH",), ("SEARCH", "ANSWER")])
+        self.assertEqual([row["parent_prefix_key"] for row in rows[1]], [(), (), ("ANSWER",)])
 
     def test_search_pauses_only_valid_active_rows_and_keeps_their_requests(self):
         orchestra = self.make_orchestra(roles=("SEARCH",), env_name="search")

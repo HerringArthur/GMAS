@@ -118,9 +118,9 @@ def build_router_subagent_group_index(
     agent_ids: Sequence[Any],
     uids: Sequence[Any],
     traj_uids: Sequence[Any],
-    prefix_keys: Sequence[Any],
     parent_prefix_keys: Sequence[Any],
-    selected_agents: Sequence[Any],
+    selected_roles: Sequence[Any],
+    env_steps: Sequence[Any],
     is_action_valid: Sequence[Any],
     router_agent_id: str = "Router Agent",
 ) -> Dict[str, Any]:
@@ -131,27 +131,29 @@ def build_router_subagent_group_index(
     row indices; a later credit stage can assign one reward/credit to the unit
     and broadcast that value back to every stored row.
 
-    SubAgent rows are grouped by ``prefix_key`` and deduplicated by
-    ``(prefix_key, traj_uid)``.  This allows the same prefix from different task
-    ``uid`` values to share a baseline while keeping different occurrences of an
-    agent on different prefixes separate.
+    Role rows are grouped by ``(uid, agent_id)``. Each trajectory contributes
+    one reward per role, regardless of repeated calls, environment steps or
+    paths. All of those response rows receive the same role credit.
 
     Router rows are grouped by ``(uid, parent_prefix_key)`` and deduplicated by
-    ``(uid, parent_prefix_key, traj_uid)``.  Invalid Router rows are excluded
+    ``(traj_uid, env_step)`` within that group. Environment steps distinguish
+    genuine retries after an empty FINISH; they do not split the comparison
+    group. Training-padding copies of a decision count once. Invalid Router rows are excluded
     from Router statistics but their row indices are returned so the caller can
     retain existing invalid-action handling.  The selected action is stored on
     each deduplicated unit; it is intentionally not part of the deduplication
-    key, so one trajectory cannot count as multiple Router choices.
+    key, so copies of one decision cannot count as different Router choices.
 
     Args:
         agent_ids: Agent name for each response row.
         uids: Task/group uid for each response row.
         traj_uids: Unique trajectory uid for each response row.
-        prefix_keys: Full worker path for each response row.
-        parent_prefix_keys: Path immediately before the Router choice/current
-            worker segment for each response row.
-        selected_agents: Parsed Router choice, including ``FINISH``. Values on
-            SubAgent rows are ignored.
+        parent_prefix_keys: Role path immediately before the Router choice.
+            Values on role rows do not affect their credit grouping.
+        selected_roles: Parsed Router choice, including ``FINISH``. Values on
+            role rows are ignored.
+        env_steps: Existing environment-step metadata, used only to identify
+            Router decisions within a comparison group.
         is_action_valid: Validity flag for each response row. Only Router rows
             with a true flag enter Router statistics.
         router_agent_id: Name used to identify Router rows.
@@ -160,9 +162,9 @@ def build_router_subagent_group_index(
         A dictionary with the following fields:
 
         ``subagent_groups``:
-            ``{prefix_key: {traj_uid: [row_indices]}}``.
+            ``{(uid, role): {traj_uid: [row_indices]}}``.
         ``router_groups``:
-            ``{(uid, parent_prefix_key): {traj_uid: {row_indices,
+            ``{(uid, parent_prefix_key): {(traj_uid, env_step): {row_indices,
             selected_action}}}``.
         ``row_to_subagent_unit`` and ``row_to_router_unit``:
             Reverse mappings used to broadcast a later credit to every original
@@ -174,68 +176,66 @@ def build_router_subagent_group_index(
         "agent_ids": agent_ids,
         "uids": uids,
         "traj_uids": traj_uids,
-        "prefix_keys": prefix_keys,
         "parent_prefix_keys": parent_prefix_keys,
-        "selected_agents": selected_agents,
+        "selected_roles": selected_roles,
+        "env_steps": env_steps,
         "is_action_valid": is_action_valid,
     }
     lengths = {name: len(values) for name, values in fields.items()}
     if len(set(lengths.values())) != 1:
         raise ValueError(f"Router/SubAgent metadata arrays must have equal lengths, got {lengths}.")
 
-    subagent_groups: Dict[Tuple[Any, ...], Dict[Any, List[int]]] = {}
-    router_groups: Dict[Tuple[Any, Tuple[Any, ...]], Dict[Any, Dict[str, Any]]] = {}
+    subagent_groups: Dict[Tuple[Any, Any], Dict[Any, List[int]]] = {}
+    router_groups: Dict[Tuple[Any, Tuple[Any, ...]], Dict[Tuple[Any, Any], Dict[str, Any]]] = {}
     row_to_subagent_unit: Dict[int, Tuple[Tuple[Any, ...], Any]] = {}
-    row_to_router_unit: Dict[int, Tuple[Any, Tuple[Any, ...], Any]] = {}
+    row_to_router_unit: Dict[int, Tuple[Any, ...]] = {}
     invalid_router_rows: List[int] = []
 
-    for row_index, (agent_id, uid, traj_uid, prefix_key, parent_prefix_key, selected_agent, valid) in enumerate(
+    for row_index, (agent_id, uid, traj_uid, parent_prefix_key, selected_role, env_step, valid) in enumerate(
         zip(
             agent_ids,
             uids,
             traj_uids,
-            prefix_keys,
             parent_prefix_keys,
-            selected_agents,
+            selected_roles,
+            env_steps,
             is_action_valid,
         )
     ):
         normalized_agent_id = _normalize_group_scalar(agent_id)
         normalized_uid = _normalize_group_scalar(uid)
         normalized_traj_uid = _normalize_group_scalar(traj_uid)
-        normalized_prefix = _normalize_prefix_key(prefix_key, "prefix_key")
-        normalized_parent_prefix = _normalize_prefix_key(parent_prefix_key, "parent_prefix_key")
-
         if normalized_agent_id != router_agent_id:
-            # The outer prefix key and inner trajectory key together implement
-            # the (traj_uid, prefix_key) statistical deduplication rule.
-            prefix_group = subagent_groups.setdefault(normalized_prefix, {})
-            prefix_group.setdefault(normalized_traj_uid, []).append(row_index)
-            row_to_subagent_unit[row_index] = (normalized_prefix, normalized_traj_uid)
+            role_group_key = (normalized_uid, normalized_agent_id)
+            role_group = subagent_groups.setdefault(role_group_key, {})
+            role_group.setdefault(normalized_traj_uid, []).append(row_index)
+            row_to_subagent_unit[row_index] = (role_group_key, normalized_traj_uid)
             continue
 
         if not bool(valid):
             invalid_router_rows.append(row_index)
             continue
 
+        normalized_parent_prefix = _normalize_prefix_key(parent_prefix_key, "parent_prefix_key")
         router_group_key = (normalized_uid, normalized_parent_prefix)
         router_group = router_groups.setdefault(router_group_key, {})
-        normalized_action = _normalize_group_scalar(selected_agent)
-        unit = router_group.get(normalized_traj_uid)
+        decision_key = (normalized_traj_uid, _normalize_group_scalar(env_step))
+        normalized_action = _normalize_group_scalar(selected_role)
+        unit = router_group.get(decision_key)
         if unit is None:
             unit = {
                 "row_indices": [],
                 "selected_action": normalized_action,
             }
-            router_group[normalized_traj_uid] = unit
+            router_group[decision_key] = unit
         elif unit["selected_action"] != normalized_action:
             raise ValueError(
                 "A Router deduplication unit contains conflicting selected actions: "
                 f"uid={normalized_uid!r}, parent_prefix_key={normalized_parent_prefix!r}, "
-                f"traj_uid={normalized_traj_uid!r}."
+                f"traj_uid={normalized_traj_uid!r}, env_step={env_step!r}."
             )
         unit["row_indices"].append(row_index)
-        row_to_router_unit[row_index] = (normalized_uid, normalized_parent_prefix, normalized_traj_uid)
+        row_to_router_unit[row_index] = (router_group_key, decision_key)
 
     return {
         "subagent_groups": subagent_groups,
@@ -273,14 +273,15 @@ def attach_episode_rewards_to_group_index(
         trajectory_rewards.setdefault(normalized_traj_uid, reward)
 
     subagent_unit_rewards: Dict[Tuple[Tuple[Any, ...], Any], Any] = {}
-    for prefix_key, trajectory_units in group_index["subagent_groups"].items():
+    for group_key, trajectory_units in group_index["subagent_groups"].items():
         for traj_uid in trajectory_units:
-            subagent_unit_rewards[(prefix_key, traj_uid)] = trajectory_rewards[traj_uid]
+            subagent_unit_rewards[(group_key, traj_uid)] = trajectory_rewards[traj_uid]
 
-    router_unit_rewards: Dict[Tuple[Any, Tuple[Any, ...], Any], Any] = {}
-    for (uid, parent_prefix_key), trajectory_units in group_index["router_groups"].items():
-        for traj_uid in trajectory_units:
-            router_unit_rewards[(uid, parent_prefix_key, traj_uid)] = trajectory_rewards[traj_uid]
+    router_unit_rewards: Dict[Tuple[Any, ...], Any] = {}
+    for group_key, decision_units in group_index["router_groups"].items():
+        for decision_key in decision_units:
+            traj_uid, _ = decision_key
+            router_unit_rewards[(group_key, decision_key)] = trajectory_rewards[traj_uid]
 
     return {
         **group_index,
@@ -291,10 +292,10 @@ def attach_episode_rewards_to_group_index(
 
 
 def compute_subagent_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute prefix-group-relative credit for deduplicated SubAgent units.
+    """Compute task-and-role-relative credit with one reward per trajectory.
 
     The group mean is computed across unique ``traj_uid`` values in each
-    ``prefix_key`` group.  All response rows belonging to one unit receive the
+    ``(uid, role)`` group. All calls of that role in one trajectory receive the
     same scalar credit; this function does not broadcast credit to tokens.
     """
     unit_rewards = group_index["subagent_unit_rewards"]
@@ -302,13 +303,13 @@ def compute_subagent_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
     group_baselines: Dict[Tuple[Any, ...], Any] = {}
     row_credits: Dict[int, Any] = {}
 
-    for prefix_key, trajectory_units in group_index["subagent_groups"].items():
-        rewards = [unit_rewards[(prefix_key, traj_uid)] for traj_uid in trajectory_units]
+    for group_key, trajectory_units in group_index["subagent_groups"].items():
+        rewards = [unit_rewards[(group_key, traj_uid)] for traj_uid in trajectory_units]
         baseline = sum(rewards) / len(rewards)
-        group_baselines[prefix_key] = baseline
+        group_baselines[group_key] = baseline
         for traj_uid, row_indices in trajectory_units.items():
-            credit = unit_rewards[(prefix_key, traj_uid)] - baseline
-            unit_credits[(prefix_key, traj_uid)] = credit
+            credit = unit_rewards[(group_key, traj_uid)] - baseline
+            unit_credits[(group_key, traj_uid)] = credit
             for row_index in row_indices:
                 row_credits[row_index] = credit
 
@@ -322,30 +323,29 @@ def compute_subagent_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
 def compute_router_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
     """Compute empirical action-relative credit for deduplicated Router units.
 
-    For each ``(uid, parent_prefix_key)`` group, every trajectory contributes
-    once to the empirical action frequency and action mean reward.  The
+    For each ``(uid, parent_prefix_key)`` group, every distinct decision
+    contributes once to the empirical action frequency and action mean reward. The
     baseline is the frequency-weighted action mean.  ``FINISH`` is treated as a
     regular action because it is already stored in ``selected_action``.
     """
     unit_rewards = group_index["router_unit_rewards"]
-    unit_credits: Dict[Tuple[Any, Tuple[Any, ...], Any], Any] = {}
+    unit_credits: Dict[Tuple[Any, ...], Any] = {}
     group_baselines: Dict[Tuple[Any, Tuple[Any, ...]], Any] = {}
     action_statistics: Dict[Tuple[Any, Tuple[Any, ...]], Dict[Any, Dict[str, Any]]] = {}
     row_credits: Dict[int, Any] = {}
 
-    for group_key, trajectory_units in group_index["router_groups"].items():
-        uid, parent_prefix_key = group_key
+    for group_key, decision_units in group_index["router_groups"].items():
         action_rewards: Dict[Any, List[Any]] = defaultdict(list)
-        for traj_uid, unit in trajectory_units.items():
+        for decision_key, unit in decision_units.items():
             action = unit["selected_action"]
-            action_rewards[action].append(unit_rewards[(uid, parent_prefix_key, traj_uid)])
+            action_rewards[action].append(unit_rewards[(group_key, decision_key)])
 
-        total_trajectories = sum(len(rewards) for rewards in action_rewards.values())
+        total_decisions = sum(len(rewards) for rewards in action_rewards.values())
         action_stats: Dict[Any, Dict[str, Any]] = {}
         baseline = 0.0
         for action, rewards in action_rewards.items():
             count = len(rewards)
-            probability = count / total_trajectories
+            probability = count / total_decisions
             mean_reward = sum(rewards) / count
             action_stats[action] = {
                 "count": count,
@@ -357,8 +357,8 @@ def compute_router_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
         group_baselines[group_key] = baseline
         action_statistics[group_key] = action_stats
 
-        for traj_uid, unit in trajectory_units.items():
-            unit_key = (uid, parent_prefix_key, traj_uid)
+        for decision_key, unit in decision_units.items():
+            unit_key = (group_key, decision_key)
             # Router credit is action-level: every trajectory choosing the
             # same action receives S_j - baseline, rather than its own
             # trajectory reward minus the baseline.
@@ -392,8 +392,8 @@ def normalize_router_subagent_credit(
 ) -> Dict[str, Any]:
     """Normalize SubAgent and Router credit within their own statistical groups.
 
-    SubAgent standard deviations use unique trajectory credits within each
-    ``prefix_key``. Router standard deviations use the empirical action
+    Role standard deviations use unique trajectory credits within each
+    ``(uid, role)`` group. Router standard deviations use the empirical action
     probabilities within each ``(uid, parent_prefix_key)`` group. No response
     row duplication is used when calculating either scale.
     """
@@ -403,23 +403,23 @@ def normalize_router_subagent_credit(
     subagent_unit_advantages: Dict[Tuple[Tuple[Any, ...], Any], Any] = {}
     subagent_group_stds: Dict[Tuple[Any, ...], Any] = {}
     subagent_row_advantages: Dict[int, Any] = {}
-    for prefix_key, trajectory_units in group_index["subagent_groups"].items():
-        credits = [subagent_unit_credits[(prefix_key, traj_uid)] for traj_uid in trajectory_units]
+    for group_key, trajectory_units in group_index["subagent_groups"].items():
+        credits = [subagent_unit_credits[(group_key, traj_uid)] for traj_uid in trajectory_units]
         variance = sum(credit * credit for credit in credits) / len(credits)
         std = math.sqrt(variance)
-        subagent_group_stds[prefix_key] = std
+        subagent_group_stds[group_key] = std
         scale = std + epsilon if norm_adv_by_std_in_grpo else 1.0
         for traj_uid, row_indices in trajectory_units.items():
-            unit_key = (prefix_key, traj_uid)
+            unit_key = (group_key, traj_uid)
             advantage = subagent_unit_credits[unit_key] / scale
             subagent_unit_advantages[unit_key] = advantage
             for row_index in row_indices:
                 subagent_row_advantages[row_index] = advantage
 
-    router_unit_advantages: Dict[Tuple[Any, Tuple[Any, ...], Any], Any] = {}
+    router_unit_advantages: Dict[Tuple[Any, ...], Any] = {}
     router_group_stds: Dict[Tuple[Any, Tuple[Any, ...]], Any] = {}
     router_row_advantages: Dict[int, Any] = {}
-    for group_key, trajectory_units in group_index["router_groups"].items():
+    for group_key, decision_units in group_index["router_groups"].items():
         action_stats = credit_result["router_action_statistics"][group_key]
         variance = sum(
             stats["probability"] * (stats["mean_reward"] - credit_result["router_group_baselines"][group_key]) ** 2
@@ -428,8 +428,8 @@ def normalize_router_subagent_credit(
         std = math.sqrt(variance)
         router_group_stds[group_key] = std
         scale = std + epsilon if norm_adv_by_std_in_grpo else 1.0
-        for traj_uid, unit in trajectory_units.items():
-            unit_key = (group_key[0], group_key[1], traj_uid)
+        for decision_key, unit in decision_units.items():
+            unit_key = (group_key, decision_key)
             action = unit["selected_action"]
             advantage = (
                 action_stats[action]["mean_reward"]
@@ -468,19 +468,14 @@ def build_router_subagent_group_index_from_batch(
     data: DataProto,
     router_agent_id: str = "Router Agent",
 ) -> Dict[str, Any]:
-    """Build Router/SubAgent grouping indices directly from a ``DataProto``.
-
-    This adapter is intentionally separate from reward extraction.  It is the
-    entry point that the future custom GRPO branch can call after batch padding
-    and before computing group statistics.
-    """
+    """Build Router/role statistics from collected rows after training padding."""
     required_fields = (
         "agent_id",
         "uid",
         "traj_uid",
-        "prefix_key",
         "parent_prefix_key",
-        "selected_agent",
+        "selected_role",
+        "env_step",
         "is_action_valid",
         "episode_rewards",
     )
@@ -495,9 +490,9 @@ def build_router_subagent_group_index_from_batch(
         agent_ids=non_tensor_batch["agent_id"],
         uids=non_tensor_batch["uid"],
         traj_uids=non_tensor_batch["traj_uid"],
-        prefix_keys=non_tensor_batch["prefix_key"],
         parent_prefix_keys=non_tensor_batch["parent_prefix_key"],
-        selected_agents=non_tensor_batch["selected_agent"],
+        selected_roles=non_tensor_batch["selected_role"],
+        env_steps=non_tensor_batch["env_step"],
         is_action_valid=non_tensor_batch["is_action_valid"],
         router_agent_id=router_agent_id,
     )
