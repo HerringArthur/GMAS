@@ -274,8 +274,10 @@ class SGLangRollout(BaseRollout):
                 "SGLang does not use vLLM's max_num_batched_tokens directly; "
                 "set engine_kwargs.sglang.max_prefill_tokens explicitly when supported by the installed SGLang version"
             )
-        if "context_length" not in sglang_kwargs and self.config.get("max_model_len") is not None:
-            sglang_kwargs["context_length"] = int(self.config.max_model_len)
+        # Match DrMAS: let SGLang derive context_length from the model unless
+        # engine_kwargs.sglang.context_length is explicitly set. The rollout's
+        # max_model_len may default to prompt_length + response_length, which
+        # SGLang 0.4.6 rejects when a request exactly fills that engine limit.
 
         return sglang_kwargs
 

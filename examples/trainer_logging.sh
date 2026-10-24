@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Shared console logging for the DrMAS and GMAS launchers.
 # Usage: run_with_trainer_log drmas|gmas train|eval command [arguments...]
+# TRAINER_LOG_DIR optionally overrides the default logs/<trainer>_trainer folder.
 run_with_trainer_log() (
     set -o pipefail
     local trainer=$1
@@ -52,7 +53,7 @@ if len(model_tag) > 180:
     digest = hashlib.sha256(model_tag.encode()).hexdigest()[:8]
     model_tag = model_tag[:160] + "_" + digest
 
-log_dir = Path(repo_root) / "logs" / f"{trainer}_trainer"
+log_dir = Path(os.environ.get("TRAINER_LOG_DIR") or Path(repo_root) / "logs" / f"{trainer}_trainer")
 log_dir.mkdir(parents=True, exist_ok=True)
 timestamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d_%H%M%S_%f")
 log_file = log_dir / f"{mode}_{model_tag}_{timestamp}.log"
