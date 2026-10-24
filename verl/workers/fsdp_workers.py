@@ -165,8 +165,7 @@ class ActorRolloutRefWorker(Worker):
                 self.config.actor.ppo_micro_batch_size_per_gpu = self.config.actor.ppo_micro_batch_size
 
             if self.config.actor.ppo_micro_batch_size_per_gpu is not None:
-                assert self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0, f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
-                assert self.config.actor.ppo_mini_batch_size // self.config.actor.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
+                assert self.config.actor.ppo_micro_batch_size_per_gpu > 0, "ppo_micro_batch_size_per_gpu must be positive"
 
         # normalize rollout config
         if self._is_rollout and self.config.rollout.log_prob_micro_batch_size is not None:
@@ -371,6 +370,8 @@ class ActorRolloutRefWorker(Worker):
             )
 
             total_steps = optim_config.get("total_training_steps", 0)
+            if total_steps <= 0:
+                raise ValueError(f"actor optim.total_training_steps must be positive, got {total_steps}")
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
             warmup_style = optim_config.get("warmup_style", "constant")
             min_lr_ratio = optim_config.get("min_lr_ratio", 0.0)

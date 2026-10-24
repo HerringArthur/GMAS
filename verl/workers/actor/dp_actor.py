@@ -51,6 +51,36 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _loss_normalizer(response_mask, loss_agg_mode):
+    """Count the actual mini-batch denominator, accounting for FSDP averaging.
+
+    Ulysses peers hold identical masks. Reducing over all FSDP ranks and
+    dividing by their world size also cancels that replication.
+    """
+    if loss_agg_mode == "seq-mean-token-sum-norm":
+        # agg_loss uses a fixed response-length divisor and is additive.
+        return None
+    if loss_agg_mode == "token-mean":
+        count = response_mask.sum().to(dtype=torch.float32)
+    elif loss_agg_mode in ("seq-mean-token-sum", "seq-mean-token-mean"):
+        count = response_mask.new_tensor(response_mask.shape[0], dtype=torch.float32)
+    else:
+        raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
+
+    world_size = 1
+    if torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+    return count.clamp_min(1) / world_size
+
+
+def _micro_batch_loss_scale(response_mask, loss_agg_mode, normalizer):
+    if normalizer is None:
+        return 1.0
+    count = response_mask.sum() if loss_agg_mode == "token-mean" else response_mask.shape[0]
+    return count / normalizer
+
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
@@ -358,12 +388,21 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.use_adaptive_ppo_mini_batch_size:
             self.config.ppo_mini_batch_size = data.meta_info.get(f"{wg_id}/ppo_mini_batch_size", self.config.ppo_mini_batch_size)
 
+        if self.config.ppo_mini_batch_size <= 0:
+            raise ValueError("ppo_mini_batch_size must be positive")
+        if has_multi_modal_inputs or not self.config.use_dynamic_bsz:
+            if not self.config.ppo_micro_batch_size_per_gpu or self.config.ppo_micro_batch_size_per_gpu <= 0:
+                raise ValueError("ppo_micro_batch_size_per_gpu must be positive")
+
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         if has_multi_modal_inputs:
-            num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
             non_tensor_select_keys = ["multi_modal_inputs"]
-            dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
+            selected = data.select(select_keys, non_tensor_select_keys)
+            dataloader = [
+                selected[start : start + self.config.ppo_mini_batch_size]
+                for start in range(0, len(selected), self.config.ppo_mini_batch_size)
+            ]
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
@@ -372,15 +411,21 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
                 mini_batch = data
+                mini_tensors = mini_batch.batch if isinstance(mini_batch, DataProto) else mini_batch
+                response_length = mini_tensors["responses"].size(1)
+                mask_key = "loss_mask" if multi_turn else "attention_mask"
+                mini_response_mask = mini_tensors[mask_key][:, -response_length:]
+                loss_agg_mode = self.config.loss_agg_mode
+                normalizer = _loss_normalizer(mini_response_mask, loss_agg_mode)
                 if has_multi_modal_inputs:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
-                    micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                    micro_batches = [
+                        mini_batch[start : start + self.config.ppo_micro_batch_size_per_gpu]
+                        for start in range(0, len(mini_batch), self.config.ppo_micro_batch_size_per_gpu)
+                    ]
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
                 else:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
@@ -408,7 +453,6 @@ class DataParallelPPOActor(BasePPOActor):
                     clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
                     entropy_coeff = self.config.entropy_coeff
-                    loss_agg_mode = self.config.loss_agg_mode
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
@@ -446,11 +490,8 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics[f"actor/{wg_id}/kl_loss"] = kl_loss.detach().item()
                         metrics[f"actor/{wg_id}/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-                    else:
-                        loss = policy_loss / self.gradient_accumulation
+                    loss_scale = _micro_batch_loss_scale(response_mask, loss_agg_mode, normalizer)
+                    loss = policy_loss * loss_scale
                     loss.backward()
 
                     data = {

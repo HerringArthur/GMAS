@@ -963,6 +963,8 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        if self.total_training_steps <= 0:
+            raise ValueError(f"total_training_steps must be positive, got {self.total_training_steps}")
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -972,6 +974,10 @@ class RayPPOTrainer:
         for wg_id, agents_list in self.wg_to_agents_mapping.items():
             wg_configs[wg_id] = agents_list[0]["config_actor_rollout_ref"]
             wg_configs[wg_id].model.path = agents_list[0]["model_id"]
+            # These configs were copied before the dataloader determined the
+            # training horizon. Each update_actor() advances the scheduler once.
+            for agent in agents_list:
+                agent["config_actor_rollout_ref"].actor.optim.total_training_steps = self.total_training_steps
 
         # create actor and rollout
         if self.hybrid_engine:
