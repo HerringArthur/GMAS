@@ -6,12 +6,15 @@ allocation and model/distributed boundaries, as in the adjacent trainer tests.
 
 import ast
 from collections import defaultdict
+from itertools import count
 import math
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
 import numpy as np
+
+from tests.trainer.ppo import test_valid_action_training as training_support
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -20,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[3]
 def load_credit():
     names = {
         "to_hashable", "_normalize_group_scalar", "_normalize_prefix_key",
-        "build_router_subagent_group_index", "attach_episode_rewards_to_group_index",
+        "build_router_subagent_group_index", "attach_training_rewards_to_group_index",
         "compute_subagent_credit", "compute_router_credit", "compute_router_subagent_credit",
         "normalize_router_subagent_credit", "build_token_level_credit_advantage",
         "build_router_subagent_group_index_from_batch",
@@ -44,11 +47,13 @@ def load_credit():
 
 
 core, compute_advantage = load_credit()
+ROW_IDS = count()
 
 
 def row(role, trajectory, reward, *, uid="Q1", prefix=(), selected="", step=1, valid=True):
     return dict(agent_id=role, uid=uid, traj_uid=trajectory, episode_rewards=reward,
-                parent_prefix_key=prefix, selected_role=selected, env_step=step, is_action_valid=valid)
+                parent_prefix_key=prefix, selected_role=selected, env_step=step, is_action_valid=valid,
+                rollout_row_id=next(ROW_IDS))
 
 
 def metadata(rows):
@@ -56,8 +61,13 @@ def metadata(rows):
             for key in rows[0]}
 
 
-def statistics(rows, normalize=False):
-    batch = SimpleNamespace(non_tensor_batch=metadata(rows))
+def statistics(rows, normalize=False, rewards=None):
+    if rewards is None:
+        rewards = [item["episode_rewards"] for item in rows]
+    batch = SimpleNamespace(
+        non_tensor_batch=metadata(rows),
+        batch={"token_level_scores": training_support.tensor([[0.0, reward] for reward in rewards])},
+    )
     groups = core.build_router_subagent_group_index_from_batch(batch)
     credits = core.compute_router_subagent_credit(groups)
     normalized = core.normalize_router_subagent_credit(groups, credits, norm_adv_by_std_in_grpo=normalize)
@@ -65,23 +75,52 @@ def statistics(rows, normalize=False):
 
 
 class RoleCreditTests(unittest.TestCase):
-    def test_role_baseline_counts_each_trajectory_once_across_calls_and_paths(self):
+    def test_role_statistics_weight_each_real_call_equally_and_ignore_padding(self):
         rows = [
             row("SOLVE", "T1", 1),
-            row("SOLVE", "T1", 1, prefix=("SOLVE", "VERIFY"), step=2),
+            row("SOLVE", "T1", 1, prefix=("SOLVE", "VERIFY"), step=2, valid=False),
             row("SOLVE", "T2", 0),
             row("VERIFY", "T1", 1, prefix=("SOLVE",)),
             row("SOLVE", "T3", 1, uid="Q2"),
             row("SOLVE", "T4", 1, uid="Q2"),
         ]
-        groups, credits, normalized = statistics(rows, normalize=True)
-        self.assertEqual(groups["subagent_groups"][("Q1", "SOLVE")], {"T1": [0, 1], "T2": [2]})
-        self.assertEqual(credits["subagent_group_baselines"],
-                         {("Q1", "SOLVE"): 0.5, ("Q1", "VERIFY"): 1.0, ("Q2", "SOLVE"): 1.0})
-        self.assertEqual(credits["subagent_row_credits"], {0: 0.5, 1: 0.5, 2: -0.5, 3: 0.0, 4: 0.0, 5: 0.0})
-        self.assertEqual(normalized["subagent_group_stds"][("Q1", "SOLVE")], 0.5)
-        self.assertAlmostEqual(normalized["subagent_row_advantages"][0], 0.5 / (0.5 + 1e-6))
-        self.assertEqual(normalized["subagent_row_advantages"][0], normalized["subagent_row_advantages"][1])
+        groups, credits, normalized = statistics(
+            rows + [rows[0], rows[1]], normalize=True, rewards=[1.0, 0.9, 0.0, 1.0, 1.0, 1.0, 1.0, 0.9],
+        )
+        key = ("Q1", "SOLVE")
+        self.assertEqual(groups["subagent_groups"][key], {
+            ("T1", rows[0]["rollout_row_id"]): [0, 6],
+            ("T1", rows[1]["rollout_row_id"]): [1, 7],
+            ("T2", rows[2]["rollout_row_id"]): [2],
+        })
+        rewards = np.array([1.0, 0.9, 0.0])
+        expected = rewards - rewards.mean()
+        self.assertAlmostEqual(credits["subagent_group_baselines"][key], 1.9 / 3)
+        self.assertAlmostEqual(normalized["subagent_group_stds"][key], rewards.std(ddof=0))
+        np.testing.assert_allclose([credits["subagent_row_credits"][i] for i in range(3)], expected)
+        np.testing.assert_allclose([normalized["subagent_row_advantages"][i] for i in range(3)],
+                                   expected / (rewards.std(ddof=0) + 1e-6))
+        self.assertGreater(normalized["subagent_row_advantages"][0], normalized["subagent_row_advantages"][1])
+        self.assertGreater(normalized["subagent_row_advantages"][1], 0)
+        for original, copy in [(0, 6), (1, 7)]:
+            self.assertEqual(normalized["subagent_row_advantages"][original],
+                             normalized["subagent_row_advantages"][copy])
+        for i in [3, 4, 5]:
+            self.assertEqual(normalized["subagent_row_advantages"][i], 0)
+
+    def test_distinct_calls_in_one_trajectory_can_have_different_advantages(self):
+        rows = [row("SEARCH", "T1", 1), row("SEARCH", "T1", 1, valid=False)]
+        _, credits, normalized = statistics(rows, normalize=True, rewards=[1.0, 0.9])
+        self.assertAlmostEqual(credits["subagent_group_baselines"][("Q1", "SEARCH")], 0.95)
+        np.testing.assert_allclose(list(normalized["subagent_row_advantages"].values()),
+                                   np.array([0.05, -0.05]) / (0.05 + 1e-6))
+
+    def test_all_invalid_role_calls_still_participate(self):
+        rows = [row("SEARCH", "T1", 1, valid=False), row("SEARCH", "T2", 0, valid=False)]
+        _, credits, normalized = statistics(rows, normalize=True, rewards=[0.9, -0.1])
+        self.assertAlmostEqual(credits["subagent_group_baselines"][("Q1", "SEARCH")], 0.4)
+        np.testing.assert_allclose(list(normalized["subagent_row_advantages"].values()),
+                                   np.array([0.5, -0.5]) / (0.5 + 1e-6))
 
     def test_router_credit_uses_action_means_and_ignores_padding_copies(self):
         rows = [
@@ -116,16 +155,37 @@ class RoleCreditTests(unittest.TestCase):
             row("Router Agent", "T1", 1, selected="FINISH"),
             row("Router Agent", "T1", 1, selected="SEARCH", step=2),
             row("Router Agent", "T2", 0, selected="FINISH"),
-            row("Router Agent", "invalid", 10, selected="", valid=False),
+            row("Router Agent", "invalid", 0, selected="", valid=False),
         ]
         groups, credits, _ = statistics(rows + [rows[0]])
-        self.assertEqual(len(groups["router_groups"][("Q1", ())]), 3)
+        self.assertEqual(len(groups["router_groups"][("Q1", ())]), 4)
         self.assertEqual(groups["invalid_router_rows"], [3])
-        self.assertNotIn(3, credits["router_row_credits"])
+        self.assertEqual(credits["router_row_credits"][3], -0.5)
         stats = credits["router_action_statistics"][("Q1", ())]
         self.assertEqual(stats["FINISH"]["count"], 2)
-        self.assertAlmostEqual(credits["router_row_credits"][1], 1 / 3)
-        self.assertAlmostEqual(credits["router_row_credits"][0], -1 / 6)
+        self.assertEqual(stats["__INVALID__"]["count"], 1)
+        self.assertEqual(credits["router_row_credits"][1], 0.5)
+        self.assertEqual(credits["router_row_credits"][0], 0.0)
+        self.assertEqual(credits["router_row_credits"][0], credits["router_row_credits"][4])
+
+    def test_invalid_retries_and_valid_route_in_same_step_are_distinct_calls(self):
+        rows = [
+            row("Router Agent", "T1", 1, valid=False),
+            row("Router Agent", "T1", 1, selected="SEARCH", valid=False),
+            row("Router Agent", "T1", 1, selected="SEARCH"),
+            row("Router Agent", "T2", 0, selected="ANSWER"),
+        ]
+        groups, credits, _ = statistics(rows + [rows[0], rows[2]], rewards=[0.9, 0.9, 1.0, 0.0, 0.9, 1.0])
+        key = ("Q1", ())
+        self.assertEqual(len(groups["router_groups"][key]), 4)
+        stats = credits["router_action_statistics"][key]
+        self.assertEqual(stats["__INVALID__"]["count"], 2)
+        self.assertAlmostEqual(stats["__INVALID__"]["mean_reward"], 0.9)
+        self.assertEqual(stats["SEARCH"]["count"], 1)
+        self.assertAlmostEqual(credits["router_group_baselines"][key], 0.7)
+        np.testing.assert_allclose([credits["router_row_credits"][i] for i in range(6)],
+                                   [0.2, 0.2, 0.3, -0.7, 0.2, 0.3])
+        self.assertEqual(len(credits["router_row_credits"]), 6)
         self.assertEqual(credits["router_row_credits"][0], credits["router_row_credits"][4])
 
     def test_single_observed_router_choice_has_zero_credit(self):
@@ -147,9 +207,47 @@ class RoleCreditTests(unittest.TestCase):
         expected = core.build_token_level_credit_advantage(original, np.ones((len(rows), 3)))[order] * mask
         np.testing.assert_array_equal(advantages, expected)
 
+    def test_custom_advantage_uses_actual_format_penalty_and_adds_kl_only_once(self):
+        for role in ["SEARCH", "Router Agent"]:
+            for normalize in [False, True]:
+                with self.subTest(role=role, normalize=normalize):
+                    ns = training_support.load_driver()
+                    batch = training_support.FormatRewardTests().make_batch()
+                    batch.non_tensor_batch.update(metadata([
+                        row(role, "T1", 1, selected="SEARCH"),
+                        row(role, "T1", 1, valid=False),
+                    ]))
+                    batch.non_tensor_batch["is_action_valid"] = np.array([True, False])
+                    ns["apply_invalid_action_penalty"](batch, invalid_action_penalty_coef=0.1)
+                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                    compute_advantage(batch, adv_estimator="grpo", credit_mode="router_subagent",
+                                      norm_adv_by_std_in_grpo=normalize)
+                    credits = np.array([0.05, -0.05])
+                    if normalize:
+                        credits /= 0.05 + 1e-6
+                    expected = credits[:, None] * np.array([[1, 1], [1, 0]])
+                    np.testing.assert_allclose(batch.batch["advantages"], expected, rtol=1e-6)
+
+                    batch.batch["old_log_probs"] = training_support.tensor([[0.1, 0.3], [0.5, 0.7]])
+                    batch.batch["ref_log_prob"] = training_support.tensor(np.zeros((2, 2)))
+                    controller = SimpleNamespace(value=0.2, update=lambda **kwargs: None)
+                    ns["apply_kl_penalty"](batch, controller)
+                    compute_advantage(batch, adv_estimator="grpo", credit_mode="router_subagent",
+                                      norm_adv_by_std_in_grpo=normalize)
+                    np.testing.assert_allclose(batch.batch["advantages"],
+                                               expected + np.array([[-0.02, -0.06], [-0.1, 0]]), rtol=1e-6)
+                    np.testing.assert_array_equal(batch.batch["returns"], batch.batch["advantages"])
+                    np.testing.assert_array_equal(batch.non_tensor_batch["episode_rewards"], [1.0, 1.0])
+
+                    batch.batch["loss_mask"] = training_support.tensor([[0, 0, 0, 1], [0, 0, 1, 0]])
+                    compute_advantage(batch, adv_estimator="grpo", credit_mode="router_subagent",
+                                      norm_adv_by_std_in_grpo=normalize, multi_turn=True)
+                    np.testing.assert_allclose(batch.batch["advantages"],
+                                               (expected + np.array([[-0.02, -0.06], [-0.1, 0]]))
+                                               * np.array([[0, 1], [1, 0]]), rtol=1e-6)
+
     def test_collector_metadata_survives_padding_and_routes_credit_to_role_models(self):
         from tests.agent_system import test_role_router_orchestra as rollout_support
-        from tests.trainer.ppo import test_valid_action_training as training_support
 
         scenario = rollout_support.RoleRouterTests()
         orchestra = scenario.make_orchestra(context_runs=1)
@@ -170,7 +268,8 @@ class RoleCreditTests(unittest.TestCase):
         rows = []
         for trajectory, reward in zip(trajectories, rewards):
             for item in trajectory:
-                rows.append({**item, "episode_rewards": reward, "row_id": len(rows)})
+                rows.append({**item, "episode_rewards": reward, "row_id": len(rows),
+                             "rollout_row_id": len(rows)})
         self.assertEqual(rows[4]["parent_prefix_key"], ("SOLVE", "VERIFY"))
         self.assertEqual(orchestra.role_paths, [("SOLVE", "VERIFY", "SOLVE"), ("SOLVE",)])
         self.assertEqual(len(orchestra.team_context[0]), 1)
@@ -180,7 +279,10 @@ class RoleCreditTests(unittest.TestCase):
 
         mask = np.array([[1, 1, 0]] * len(rows))
         batch = training_support.Batch(
-            batch={"input_ids": mask.copy(), "response_mask": mask.copy()},
+            batch={
+                "input_ids": mask.copy(), "response_mask": mask.copy(),
+                "token_level_scores": training_support.tensor([[0.0, item["episode_rewards"], 0.0] for item in rows]),
+            },
             non_tensor_batch=metadata(rows),
         )
         utils = training_support.load_driver()
@@ -201,15 +303,15 @@ class RoleCreditTests(unittest.TestCase):
         padded = utils["combine_batches"](split)
         self.assertGreater(len(padded), len(rows))
         compute_advantage(padded, adv_estimator="grpo", credit_mode="router_subagent", norm_adv_by_std_in_grpo=False)
-        expected = np.array([0, 0.5, 0.5, 0, 0, 0.5, 0, 0, -0.5, -0.5])
-        np.testing.assert_array_equal(padded.batch["advantages"][:, 0], expected[padded.non_tensor_batch["row_id"].astype(int)])
+        expected = np.array([0, 1 / 3, 0.5, 0, 0, 1 / 3, 0, 0, -2 / 3, -0.5])
+        np.testing.assert_allclose(padded.batch["advantages"][:, 0], expected[padded.non_tensor_batch["row_id"].astype(int)])
         np.testing.assert_array_equal(padded.batch["advantages"][:, 2], 0)
         updates = utils["split_batch_by_wg_ids"](padded, worker_groups)
         self.assertNotIn("policy:REVISE", updates)
         for wg_id, sub_batch in updates.items():
             self.assertTrue(all(wg == wg_id for wg in sub_batch.non_tensor_batch["wg_id"]))
-            np.testing.assert_array_equal(sub_batch.batch["advantages"][:, 0],
-                                          expected[sub_batch.non_tensor_batch["row_id"].astype(int)])
+            np.testing.assert_allclose(sub_batch.batch["advantages"][:, 0],
+                                       expected[sub_batch.non_tensor_batch["row_id"].astype(int)])
 
 
 if __name__ == "__main__":

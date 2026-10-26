@@ -70,7 +70,6 @@ from agent_system.multi_turn_rollout import (
     split_batch_by_wg_ids,
     combine_batches,
     get_valid_action_mask,
-    filter_valid_action_rows,
 )
 from agent_system.agent.utils import build_wg_ids, normalize_agent_id, normalize_model_id
 
@@ -194,12 +193,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     kld = kld * response_mask
     beta = kl_ctrl.value
 
-    if "invalid_action_penalty" in data.batch.keys():
-        invalid_action_penalty = data.batch["invalid_action_penalty"]
-    else:
-        invalid_action_penalty = torch.zeros_like(token_level_scores)
     kl_penalty_rewards = -beta * kld
-    token_level_rewards = token_level_scores + invalid_action_penalty + kl_penalty_rewards
+    token_level_rewards = token_level_scores + kl_penalty_rewards
 
     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
@@ -214,8 +209,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=float):
+    """Subtract format penalties from scores before advantage computation."""
     reward_tensor = data.batch['token_level_scores']
-    invalid_action_penalty = torch.zeros_like(reward_tensor)
     if 'step_rewards' in data.batch.keys():
         step_rewards = data.batch['step_rewards']
     for i in range(len(data)):
@@ -229,14 +224,12 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
 
         action_valids = data_item.non_tensor_batch['is_action_valid'].astype(np.float32)
         action_invalids = torch.tensor(1 - action_valids, dtype=torch.float32, device=prompt_ids.device).squeeze(0)
-        # Keep the environment reward unchanged and store the penalty separately.
-        invalid_action_penalty[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
+        reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
 
         if 'step_rewards' in data.batch.keys():
             step_rewards[i] -= invalid_action_penalty_coef * action_invalids
     
     valid_action_ratio = np.mean(data.non_tensor_batch['is_action_valid'].astype(np.float32)).item()
-    data.batch["invalid_action_penalty"] = invalid_action_penalty
     metrics = {'episode/valid_action_ratio': valid_action_ratio}
     return data, metrics
 
@@ -317,6 +310,9 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             response_length = grpo_calculation_mask.size(1)  # Get length from the initial response mask
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]  # This mask is the one intended for GRPO
         if credit_mode == "router_subagent":
+            # Credit uses each real call's token_level_scores, including format
+            # penalties, before normalization. KL remains a separate token-level
+            # adjustment below and must not be included in the credit input.
             group_index = core_algos.build_router_subagent_group_index_from_batch(data)
             credit_result = core_algos.compute_router_subagent_credit(group_index)
             normalized_credit = core_algos.normalize_router_subagent_credit(
@@ -328,16 +324,11 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 normalized_credit,
                 grpo_calculation_mask,
             )
-            if "invalid_action_penalty" in data.batch.keys():
-                invalid_action_penalty = data.batch["invalid_action_penalty"]
-            else:
-                invalid_action_penalty = torch.zeros_like(credit_advantages)
             if "kl_penalty" in data.batch.keys():
                 kl_penalty_rewards = data.batch["kl_penalty"]
             else:
                 kl_penalty_rewards = torch.zeros_like(credit_advantages)
-            penalty_advantages = (invalid_action_penalty + kl_penalty_rewards) * grpo_calculation_mask
-            advantages = credit_advantages + penalty_advantages
+            advantages = credit_advantages + kl_penalty_rewards * grpo_calculation_mask
             returns = advantages
         else:
             # Call compute_grpo_outcome_advantage with parameters matching its definition
@@ -1276,6 +1267,8 @@ class RayPPOTrainer:
                     # batch = batch.union(gen_batch_output)
                     del batch
                     batch = gen_batch_output
+                    # Preserve real call identity through padding and reordering.
+                    batch.non_tensor_batch["rollout_row_id"] = np.arange(len(batch), dtype=np.int64)
                     rollout_valid_action_mask = get_valid_action_mask(batch)
 
                     # Capture actual trajectories before per-agent duplication/balancing.
@@ -1292,20 +1285,17 @@ class RayPPOTrainer:
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
                     
-                    # Record validity before filtering or copying rows for worker
-                    # divisibility. Repaired protocols remain invalid for training.
+                    # Record format validity before copying rows for worker
+                    # divisibility. Invalid outputs remain available for training.
                     metrics["training/invalid_action_rows"] = int((~rollout_valid_action_mask).sum())
                     metrics["training/valid_action_rows"] = int(rollout_valid_action_mask.sum())
                     metrics["episode/valid_action_ratio"] = (
                         float(rollout_valid_action_mask.mean()) if len(batch) else 0.0
                     )
                     unique_wg_ids = list(self.wg_to_agents_mapping.keys())
-                    training_batch = filter_valid_action_rows(batch)
-                    has_training_rows = training_batch is not None and len(training_batch) > 0
-                    metrics["training/skipped_no_valid_actions"] = int(not has_training_rows)
+                    has_training_rows = len(batch) > 0
+                    metrics["training/skipped_empty_batch"] = int(not has_training_rows)
                     if has_training_rows:
-                        batch = training_batch
-                        # Only valid rows may be padded, balanced, scored or updated.
                         multiagent_batch: Dict[str, DataProto] = split_batch_by_wg_ids(batch, unique_wg_ids)
 
                         for wg_id in multiagent_batch.keys():
@@ -1438,12 +1428,7 @@ class RayPPOTrainer:
                                 metrics.update(kl_metrics)
                             else:
                                 batch.batch["kl_penalty"] = torch.zeros_like(batch.batch["token_level_scores"])
-                                if "invalid_action_penalty" in batch.batch.keys():
-                                    batch.batch["token_level_rewards"] = (
-                                        batch.batch["token_level_scores"] + batch.batch["invalid_action_penalty"]
-                                    )
-                                else:
-                                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                             # compute advantages, executed on the driver process
 
@@ -1524,7 +1509,7 @@ class RayPPOTrainer:
                         # Keep an empty training batch for benchmark counts. Validation,
                         # checkpointing and step logging still follow their normal schedule.
                         batch = batch.select_idxs(np.empty(0, dtype=np.int64))
-                        print(f"Skipping training at step {self.global_steps}: no valid rollout actions.")
+                        print(f"Skipping training at step {self.global_steps}: empty rollout batch.")
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):

@@ -7,7 +7,8 @@ Run: python3 -m unittest discover -s tests/trainer/ppo -p 'test_valid_action_tra
 """
 
 import ast
-from contextlib import contextmanager
+from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from enum import Enum
 from pathlib import Path
@@ -32,6 +33,16 @@ class Tensor(np.ndarray):
     def detach(self):
         return self
 
+    @property
+    def device(self):
+        return 'cpu'
+
+    def sum(self, dim=None, **kwargs):
+        return tensor(np.asarray(self).sum(axis=kwargs.pop('axis', dim), **kwargs))
+
+    def unsqueeze(self, dim):
+        return tensor(np.expand_dims(np.asarray(self), axis=dim))
+
 
 def tensor(value):
     return np.asarray(value).view(Tensor)
@@ -45,6 +56,12 @@ class Batch:
 
     def __len__(self):
         return next(iter(self.batch.values())).shape[0]
+
+    def __getitem__(self, index):
+        return SimpleNamespace(
+            batch={key: value[index] for key, value in self.batch.items()},
+            non_tensor_batch={key: value[index] for key, value in self.non_tensor_batch.items()},
+        )
 
     @classmethod
     def from_single_dict(cls, data):
@@ -106,15 +123,29 @@ def load_driver():
     """Load production bodies, avoiding unrelated import-time GPU dependencies."""
     namespace = {
         'np': np, 'DataProto': Batch, 'deepcopy': deepcopy, 'Enum': Enum,
-        '_timer': timer, 'pprint': lambda *args: None,
-        'torch': SimpleNamespace(sum=lambda value, dim: value.sum(dim), zeros_like=np.zeros_like),
+        '_timer': timer, 'pprint': lambda *args: None, 'defaultdict': defaultdict,
+        'torch': SimpleNamespace(
+            sum=lambda value, dim: value.sum(dim), zeros_like=np.zeros_like,
+            tensor=lambda value, **kw: tensor(np.atleast_1d(value).astype(kw.get('dtype', float))),
+            float32=np.float32, no_grad=nullcontext,
+            stack=lambda values: tensor(np.stack([np.asarray(value) for value in values])),
+            mean=lambda value, dim=None: tensor(np.asarray(value).mean(axis=dim)),
+            std=lambda value: tensor(np.asarray(value).std(ddof=1)),
+        ),
+        'masked_mean': lambda value, mask, axis: tensor(
+            (np.asarray(value) * mask).sum(axis=axis) / np.asarray(mask).sum(axis=axis)
+        ),
     }
     specs = {
         'agent_system/multi_turn_rollout/utils.py': {
-            'get_valid_action_mask', 'filter_valid_action_rows', 'adjust_batch',
+            'get_valid_action_mask', 'adjust_batch',
             'split_batch_by_wg_ids', 'combine_batches',
         },
-        'verl/trainer/ppo/ray_trainer.py': {'AdvantageEstimator', 'compute_response_mask'},
+        'verl/trainer/ppo/ray_trainer.py': {
+            'AdvantageEstimator', 'compute_response_mask', 'apply_invalid_action_penalty',
+            'apply_kl_penalty', 'compute_advantage',
+        },
+        'verl/trainer/ppo/core_algos.py': {'compute_grpo_outcome_advantage'},
     }
     nodes = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)]
     for path, names in specs.items():
@@ -124,6 +155,10 @@ def load_driver():
             trainer = next(node for node in tree.body if getattr(node, 'name', '') == 'RayPPOTrainer')
             nodes.append(next(node for node in trainer.body if getattr(node, 'name', '') == 'fit'))
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), '<trainer-test>', 'exec'), namespace)
+    namespace['core_algos'] = SimpleNamespace(
+        compute_grpo_outcome_advantage=namespace['compute_grpo_outcome_advantage'],
+        kl_penalty=lambda logprob, ref_logprob, kl_penalty: logprob - ref_logprob,
+    )
     return namespace
 
 
@@ -150,14 +185,12 @@ def rollout(groups, valid=None):
 
 
 class ValidActionTrainingTests(unittest.TestCase):
-    def run_fit(self, batches, async_reward=False, balance=True):
+    def run_fit(self, batches, async_reward=False, balance=True, use_penalty=True):
         ns = load_driver()
         self.calls, self.logs, self.adjustments = [], [], []
         groups = ['router', 'worker', 'unused']
 
         def inspect_batch(stage, batch, wg=None):
-            flags = batch.non_tensor_batch.get('is_action_valid', np.ones(len(batch), dtype=bool))
-            self.assertTrue(flags.all(), stage)
             self.assertGreater(len(batch), 0, stage)
             if wg is not None:
                 self.assertTrue((batch.non_tensor_batch['wg_id'] == wg).all())
@@ -169,7 +202,9 @@ class ValidActionTrainingTests(unittest.TestCase):
             return tensor(np.column_stack([np.zeros(len(batch)), ids])), {'reward_row': ids.tolist()}
 
         def assert_reward_alignment(batch):
-            np.testing.assert_array_equal(batch.batch['token_level_scores'][:, -1], batch.non_tensor_batch['row_id'])
+            flags = batch.non_tensor_batch.get('is_action_valid', np.ones(len(batch), dtype=bool))
+            expected = batch.non_tensor_batch['row_id'] - 0.1 * (~flags) * use_penalty
+            np.testing.assert_allclose(batch.batch['token_level_scores'][:, -1], expected)
             np.testing.assert_array_equal(batch.non_tensor_batch['reward_row'], batch.non_tensor_batch['row_id'])
 
         def worker(wg):
@@ -203,6 +238,7 @@ class ValidActionTrainingTests(unittest.TestCase):
             inspect_batch('advantage', batch)
             assert_reward_alignment(batch)
             self.assertEqual(kwargs['credit_mode'], 'router_subagent')
+            np.testing.assert_array_equal(batch.batch['token_level_rewards'], batch.batch['token_level_scores'])
             batch.batch['advantages'] = batch.batch['token_level_scores']
             batch.batch['returns'] = batch.batch['token_level_scores']
             return batch
@@ -214,10 +250,11 @@ class ValidActionTrainingTests(unittest.TestCase):
             self.adjustments.append((wg_id, len(data)))
             return original_adjust(config, data, wg_id)
 
+        original_penalty = ns['apply_invalid_action_penalty']
+
         def penalty(batch, **kwargs):
             inspect_batch('penalty', batch)
-            batch.batch['invalid_action_penalty'] = tensor(np.zeros_like(batch.batch['responses']))
-            return batch, {'episode/valid_action_ratio': 1.0}
+            return original_penalty(batch, **kwargs)
 
         def balance_batch(batch, wg_id, **kwargs):
             inspect_batch('balance', batch, wg_id)
@@ -226,7 +263,7 @@ class ValidActionTrainingTests(unittest.TestCase):
         actor_config = Config(
             actor=Config(use_adaptive_ppo_mini_batch_size=True, ppo_mini_update_num=1,
                          ppo_micro_batch_size_per_gpu=2, use_kl_loss=True, loss_agg_mode='token-mean',
-                         use_invalid_action_penalty=True, invalid_action_penalty_coef=0.1),
+                         use_invalid_action_penalty=use_penalty, invalid_action_penalty_coef=0.1),
             rollout=Config(log_prob_micro_batch_size_per_gpu=2, n=1, multi_turn=Config(enable=False)),
             ref=Config(log_prob_micro_batch_size_per_gpu=2),
         )
@@ -263,7 +300,10 @@ class ValidActionTrainingTests(unittest.TestCase):
             compute_reward_async=SimpleNamespace(remote=lambda batch, *args: scores(batch)),
             ray=SimpleNamespace(get=lambda result: result), apply_invalid_action_penalty=penalty,
             compute_advantage=advantage, agg_loss=lambda **kw: tensor(1.0), reduce_metrics=lambda x: x,
-            compute_data_metrics=lambda **kw: {}, compute_timing_metrics=lambda **kw: {},
+            compute_data_metrics=lambda **kw: {},
+            compute_timing_metrics=lambda **kw: {
+                f'timing_s/{name}': value for name, value in kw['timing_raw'].items()
+            },
             compute_throughout_metrics=lambda **kw: {},
         )
         self.trainer = SimpleNamespace(
@@ -290,45 +330,62 @@ class ValidActionTrainingTests(unittest.TestCase):
         self.assertEqual(self.trainer._save_checkpoint.call_count, len(batches))
         self.assertEqual(self.benchmark.record_step.call_count, len(batches))
 
-    def test_filters_before_padding_and_all_model_calls_with_reward_alignment(self):
+    def test_keeps_invalid_rows_through_padding_and_updates_with_penalized_rewards(self):
         for asynchronous in [False, True]:
             with self.subTest(asynchronous=asynchronous):
                 source = rollout(['router', 'worker', 'router', 'worker', 'unused', 'worker', 'worker', 'router'],
                                  [True, True, False, False, False, True, True, False])
                 self.run_fit([source], async_reward=asynchronous)
-                self.assertEqual(self.adjustments, [('router', 1), ('worker', 3)])
+                self.assertEqual(self.adjustments, [('router', 3), ('worker', 4), ('unused', 1)])
                 self.assertEqual(len(source), 8)
                 self.assertEqual(self.logs[0][1]['training/invalid_action_rows'], 4)
                 self.assertEqual(self.logs[0][1]['episode/valid_action_ratio'], 0.5)
                 actors = {wg: ids for stage, wg, ids in self.calls if stage == 'actor'}
-                self.assertEqual(set(actors), {'router', 'worker'})
-                self.assertEqual(len(actors['router']), 2)
+                self.assertEqual(set(actors), {'router', 'worker', 'unused'})
+                self.assertEqual(len(actors['router']), 4)
                 self.assertEqual(len(actors['worker']), 4)
+                self.assertEqual(len(actors['unused']), 2)
+                self.assertEqual(set(sum(actors.values(), [])), set(source.non_tensor_batch['row_id']))
                 self.assertEqual(len(self.benchmark.record_rollouts.call_args.args[0]), 8)
                 trained = self.benchmark.record_step.call_args.args[2]
-                self.assertEqual(len(trained), 6)
-                self.assertEqual(trained.meta_info['router/ppo_mini_batch_size'], 2)
+                self.assertEqual(len(trained), 10)
+                np.testing.assert_array_equal(
+                    trained.non_tensor_batch['rollout_row_id'], trained.non_tensor_batch['row_id'] - 10,
+                )
+                np.testing.assert_array_equal(
+                    trained.non_tensor_batch['is_action_valid'],
+                    source.non_tensor_batch['is_action_valid'][trained.non_tensor_batch['row_id'] - 10],
+                )
+                self.assertEqual(trained.meta_info['router/ppo_mini_batch_size'], 4)
                 self.assertEqual(trained.meta_info['worker/ppo_mini_batch_size'], 4)
                 dumped = self.trainer._dump_generations.call_args.kwargs
-                self.assertEqual(dumped['outputs'], dumped['scores'])
+                np.testing.assert_allclose(
+                    dumped['scores'],
+                    np.asarray(dumped['outputs']) - 0.1 * (~trained.non_tensor_batch['is_action_valid']),
+                )
                 self.assertEqual(dumped['outputs'], dumped['reward_extra_infos_dict']['reward_row'])
 
-    def test_all_invalid_skips_models_and_next_step_still_trains(self):
+    def test_all_invalid_and_following_valid_batch_both_train(self):
         source = rollout(['router', 'worker'], [False, False])
         self.run_fit([source, rollout(['worker'], [True])])
-        self.assertEqual(self.logs[0][1]['training/skipped_no_valid_actions'], 1)
-        self.assertEqual(self.logs[1][1]['training/skipped_no_valid_actions'], 0)
+        self.assertEqual(self.logs[0][1]['training/skipped_empty_batch'], 0)
+        self.assertEqual(self.logs[1][1]['training/skipped_empty_batch'], 0)
         self.assertEqual(self.logs[0][1]['training/valid_action_rows'], 0)
         self.assertIn('timing_s/step', self.logs[0][1])
-        self.assertEqual(self.adjustments, [('worker', 1)])
-        self.assertEqual(len(self.benchmark.record_step.call_args_list[0].args[2]), 0)
+        self.assertEqual(self.adjustments, [('router', 1), ('worker', 1), ('worker', 1)])
+        self.assertEqual(len(self.benchmark.record_step.call_args_list[0].args[2]), 4)
         self.assertEqual(len(source), 2)
 
-    def test_all_invalid_last_step_finishes_without_model_work(self):
+    def test_all_invalid_last_step_still_updates_models(self):
         self.run_fit([rollout(['router', 'worker'], [False, False])])
-        self.assertEqual(self.calls, [])
+        self.assertEqual({wg for stage, wg, _ in self.calls if stage == 'actor'}, {'router', 'worker'})
         self.assertEqual(self.trainer.global_steps, 2)
-        self.trainer._dump_generations.assert_not_called()
+        self.trainer._dump_generations.assert_called_once()
+
+    def test_disabled_penalty_still_keeps_invalid_rows(self):
+        self.run_fit([rollout(['router', 'worker'], [False, True])], use_penalty=False)
+        self.assertFalse(any(stage == 'penalty' for stage, _, _ in self.calls))
+        self.assertEqual({wg for stage, wg, _ in self.calls if stage == 'actor'}, {'router', 'worker'})
 
     def test_legacy_batch_without_validity_flags_is_fully_trainable(self):
         self.run_fit([rollout(['router', 'worker'])], balance=False)
@@ -339,7 +396,59 @@ class ValidActionTrainingTests(unittest.TestCase):
     def test_empty_rollout_is_skipped(self):
         self.run_fit([rollout([], [])])
         self.assertEqual(self.calls, [])
-        self.assertEqual(self.logs[0][1]['training/skipped_no_valid_actions'], 1)
+        self.assertEqual(self.logs[0][1]['training/skipped_empty_batch'], 1)
+
+
+class FormatRewardTests(unittest.TestCase):
+    def make_batch(self):
+        class TensorDict(dict):
+            @property
+            def batch_size(self):
+                return next(iter(self.values())).shape[:1]
+
+        batch = rollout(['worker', 'worker'], [True, False])
+        batch.batch = TensorDict(batch.batch)
+        batch.batch['attention_mask'][1, -1] = 0
+        batch.batch['response_mask'] = tensor([[1, 1], [1, 0]])
+        batch.batch['token_level_scores'] = tensor([[0.0, 1.0], [1.0, 0.0]])
+        batch.non_tensor_batch.update(
+            episode_rewards=np.array([1.0, 1.0]), uid=np.array(['Q', 'Q']),
+            traj_uid=np.array(['T1', 'T2']),
+        )
+        return batch
+
+    def test_penalty_changes_terminal_score_and_step_reward_but_not_episode_reward(self):
+        ns, batch = load_driver(), self.make_batch()
+        batch.batch['step_rewards'] = tensor([0.5, 0.5])
+        _, metrics = ns['apply_invalid_action_penalty'](batch, invalid_action_penalty_coef=0.1)
+        np.testing.assert_allclose(batch.batch['token_level_scores'], [[0.0, 1.0], [0.9, 0.0]])
+        np.testing.assert_allclose(batch.batch['step_rewards'], [0.5, 0.4])
+        np.testing.assert_array_equal(batch.non_tensor_batch['episode_rewards'], [1.0, 1.0])
+        self.assertNotIn('invalid_action_penalty', batch.batch)
+        self.assertEqual(metrics['episode/valid_action_ratio'], 0.5)
+
+    def test_kl_combines_with_already_penalized_scores_once(self):
+        ns, batch = load_driver(), self.make_batch()
+        ns['apply_invalid_action_penalty'](batch, invalid_action_penalty_coef=0.1)
+        batch.batch['old_log_probs'] = tensor(np.ones((2, 2)))
+        batch.batch['ref_log_prob'] = tensor(np.zeros((2, 2)))
+        controller = SimpleNamespace(value=0.2, update=Mock())
+        ns['apply_kl_penalty'](batch, controller)
+        np.testing.assert_allclose(batch.batch['token_level_rewards'], [[-0.2, 0.8], [0.7, 0.0]])
+        np.testing.assert_allclose(batch.batch['token_level_scores'], [[0.0, 1.0], [0.9, 0.0]])
+        controller.update.assert_called_once_with(current_kl=1.0, n_steps=2)
+
+    def test_standard_grpo_normalizes_penalized_rewards_and_broadcasts_to_response(self):
+        ns, batch = load_driver(), self.make_batch()
+        ns['apply_invalid_action_penalty'](batch, invalid_action_penalty_coef=0.1)
+        batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+        ns['compute_advantage'](batch, adv_estimator=ns['AdvantageEstimator'].GRPO,
+                                credit_mode='standard', group_by_agent_id=True)
+        scores = np.array([1.0, 0.9])
+        expected = (scores - scores.mean()) / (scores.std(ddof=1) + 1e-6)
+        np.testing.assert_allclose(
+            batch.batch['advantages'], expected[:, None] * np.array([[1, 1], [1, 0]]),
+        )
 
 
 if __name__ == '__main__':

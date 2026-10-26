@@ -128,21 +128,25 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 benchmark.TrainingBenchmark(self.config(folder), 3)
 
-    def test_invalid_rollout_rows_are_excluded_from_copy_counts(self):
-        with tempfile.TemporaryDirectory() as folder:
-            recorder = benchmark.TrainingBenchmark(self.config(folder, samples=0), 2)
-            rollout = Batch()
-            rollout.non_tensor_batch["is_action_valid"] = [True, False, True]
-            metrics = recorder.record_rollouts(rollout, {}, 1, 2)
-            metrics.update({
-                "timing_s/step": 10.0,
-                "timing_s/dump_rollout_samples": 0.0,
-            })
-            recorder.record_step(metrics, 1, Batch(training=True))
-            self.assertEqual(metrics["benchmark/valid_rollout_rows"], 2)
-            self.assertEqual(metrics["benchmark/copied_rows"], 3)
-            self.assertEqual(metrics["benchmark/copied_rows/router"], 2)
-            self.assertEqual(metrics["benchmark/copied_rows/worker"], 1)
+    def test_retained_invalid_rollout_rows_are_not_counted_as_padding(self):
+        for valid_flags in ([True, False, True], [False, False, False]):
+            for padded in (False, True):
+                with self.subTest(valid_flags=valid_flags, padded=padded), tempfile.TemporaryDirectory() as folder:
+                    recorder = benchmark.TrainingBenchmark(self.config(folder, samples=0), 2)
+                    rollout = Batch()
+                    rollout.non_tensor_batch["is_action_valid"] = valid_flags
+                    metrics = recorder.record_rollouts(rollout, {}, 1, 2)
+                    metrics.update({
+                        "timing_s/step": 10.0,
+                        "timing_s/dump_rollout_samples": 0.0,
+                    })
+                    recorder.record_step(metrics, 1, Batch(training=padded))
+                    self.assertEqual(metrics["benchmark/valid_rollout_rows"], sum(valid_flags))
+                    self.assertEqual(metrics["benchmark/rollout_rows"], 3)
+                    self.assertEqual(metrics["benchmark/training_rows"], 5 if padded else 3)
+                    self.assertEqual(metrics["benchmark/copied_rows"], 2 if padded else 0)
+                    self.assertEqual(metrics["benchmark/copied_rows/router"], 1 if padded else 0)
+                    self.assertEqual(metrics["benchmark/copied_rows/worker"], 1 if padded else 0)
 
     def test_invalid_warmup_and_resume_rejected(self):
         with tempfile.TemporaryDirectory() as folder:

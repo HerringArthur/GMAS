@@ -122,27 +122,27 @@ def build_router_subagent_group_index(
     selected_roles: Sequence[Any],
     env_steps: Sequence[Any],
     is_action_valid: Sequence[Any],
+    rollout_row_ids: Sequence[Any],
     router_agent_id: str = "Router Agent",
 ) -> Dict[str, Any]:
-    """Build statistical grouping and trajectory-deduplication indices.
+    """Build statistical grouping and response-deduplication indices.
 
     This helper deliberately does not inspect rewards and does not remove rows
     from the training batch.  Each deduplication unit stores all of its original
     row indices; a later credit stage can assign one reward/credit to the unit
     and broadcast that value back to every stored row.
 
-    Role rows are grouped by ``(uid, agent_id)``. Each trajectory contributes
-    one reward per role, regardless of repeated calls, environment steps or
-    paths. All of those response rows receive the same role credit.
+    Role rows are grouped by ``(uid, agent_id)``. Each real call contributes
+    one reward with equal weight, including repeated calls within a trajectory.
+    Only padding copies with the same ``(traj_uid, rollout_row_id)`` share a
+    statistical unit and receive the same role credit.
 
     Router rows are grouped by ``(uid, parent_prefix_key)`` and deduplicated by
-    ``(traj_uid, env_step)`` within that group. Environment steps distinguish
-    genuine retries after an empty FINISH; they do not split the comparison
-    group. Training-padding copies of a decision count once. Invalid Router rows are excluded
-    from Router statistics but their row indices are returned so the caller can
-    retain existing invalid-action handling.  The selected action is stored on
-    each deduplicated unit; it is intentionally not part of the deduplication
-    key, so copies of one decision cannot count as different Router choices.
+    ``(traj_uid, env_step, rollout_row_id)`` within that group. The row ID is
+    assigned before training padding, so real retries count separately even
+    within one environment step, while padding copies count once. Invalid
+    Router outputs enter the same comparison group as the internal statistical
+    action ``__INVALID__``; this does not make them executable routes.
 
     Args:
         agent_ids: Agent name for each response row.
@@ -154,17 +154,19 @@ def build_router_subagent_group_index(
             role rows are ignored.
         env_steps: Existing environment-step metadata, used only to identify
             Router decisions within a comparison group.
-        is_action_valid: Validity flag for each response row. Only Router rows
-            with a true flag enter Router statistics.
+        is_action_valid: Validity flag for each response row. Invalid Router
+            outputs use the internal ``__INVALID__`` action for statistics.
+        rollout_row_ids: IDs assigned to actual responses before padding.
+            Copies of a response must preserve its ID.
         router_agent_id: Name used to identify Router rows.
 
     Returns:
         A dictionary with the following fields:
 
         ``subagent_groups``:
-            ``{(uid, role): {traj_uid: [row_indices]}}``.
+            ``{(uid, role): {(traj_uid, rollout_row_id): [row_indices]}}``.
         ``router_groups``:
-            ``{(uid, parent_prefix_key): {(traj_uid, env_step): {row_indices,
+            ``{(uid, parent_prefix_key): {(traj_uid, env_step, rollout_row_id): {row_indices,
             selected_action}}}``.
         ``row_to_subagent_unit`` and ``row_to_router_unit``:
             Reverse mappings used to broadcast a later credit to every original
@@ -180,18 +182,19 @@ def build_router_subagent_group_index(
         "selected_roles": selected_roles,
         "env_steps": env_steps,
         "is_action_valid": is_action_valid,
+        "rollout_row_ids": rollout_row_ids,
     }
     lengths = {name: len(values) for name, values in fields.items()}
     if len(set(lengths.values())) != 1:
         raise ValueError(f"Router/SubAgent metadata arrays must have equal lengths, got {lengths}.")
 
-    subagent_groups: Dict[Tuple[Any, Any], Dict[Any, List[int]]] = {}
-    router_groups: Dict[Tuple[Any, Tuple[Any, ...]], Dict[Tuple[Any, Any], Dict[str, Any]]] = {}
-    row_to_subagent_unit: Dict[int, Tuple[Tuple[Any, ...], Any]] = {}
+    subagent_groups: Dict[Tuple[Any, Any], Dict[Tuple[Any, Any], List[int]]] = {}
+    router_groups: Dict[Tuple[Any, Tuple[Any, ...]], Dict[Tuple[Any, ...], Dict[str, Any]]] = {}
+    row_to_subagent_unit: Dict[int, Tuple[Tuple[Any, ...], Tuple[Any, Any]]] = {}
     row_to_router_unit: Dict[int, Tuple[Any, ...]] = {}
     invalid_router_rows: List[int] = []
 
-    for row_index, (agent_id, uid, traj_uid, parent_prefix_key, selected_role, env_step, valid) in enumerate(
+    for row_index, (agent_id, uid, traj_uid, parent_prefix_key, selected_role, env_step, valid, rollout_row_id) in enumerate(
         zip(
             agent_ids,
             uids,
@@ -200,27 +203,31 @@ def build_router_subagent_group_index(
             selected_roles,
             env_steps,
             is_action_valid,
+            rollout_row_ids,
         )
     ):
         normalized_agent_id = _normalize_group_scalar(agent_id)
         normalized_uid = _normalize_group_scalar(uid)
         normalized_traj_uid = _normalize_group_scalar(traj_uid)
+        normalized_row_id = _normalize_group_scalar(rollout_row_id)
         if normalized_agent_id != router_agent_id:
             role_group_key = (normalized_uid, normalized_agent_id)
             role_group = subagent_groups.setdefault(role_group_key, {})
-            role_group.setdefault(normalized_traj_uid, []).append(row_index)
-            row_to_subagent_unit[row_index] = (role_group_key, normalized_traj_uid)
+            response_key = (normalized_traj_uid, normalized_row_id)
+            role_group.setdefault(response_key, []).append(row_index)
+            row_to_subagent_unit[row_index] = (role_group_key, response_key)
             continue
 
         if not bool(valid):
             invalid_router_rows.append(row_index)
-            continue
 
         normalized_parent_prefix = _normalize_prefix_key(parent_prefix_key, "parent_prefix_key")
         router_group_key = (normalized_uid, normalized_parent_prefix)
         router_group = router_groups.setdefault(router_group_key, {})
-        decision_key = (normalized_traj_uid, _normalize_group_scalar(env_step))
-        normalized_action = _normalize_group_scalar(selected_role)
+        decision_key = (
+            normalized_traj_uid, _normalize_group_scalar(env_step), normalized_row_id,
+        )
+        normalized_action = _normalize_group_scalar(selected_role) if bool(valid) else "__INVALID__"
         unit = router_group.get(decision_key)
         if unit is None:
             unit = {
@@ -243,73 +250,63 @@ def build_router_subagent_group_index(
         "row_to_subagent_unit": row_to_subagent_unit,
         "row_to_router_unit": row_to_router_unit,
         "invalid_router_rows": invalid_router_rows,
+        "rollout_row_ids": [_normalize_group_scalar(row_id) for row_id in rollout_row_ids],
     }
 
 
-def attach_episode_rewards_to_group_index(
+def attach_training_rewards_to_group_index(
     group_index: Dict[str, Any],
-    traj_uids: Sequence[Any],
-    episode_rewards: Sequence[Any],
+    row_rewards: Sequence[Any],
 ) -> Dict[str, Any]:
-    """Attach one rollout-level reward to every deduplicated unit.
+    """Attach each real call's adjusted reward, counting padding copies once.
 
-    ``episode_rewards`` is the cumulative environment reward produced by the
-    rollout collector.  It is copied onto every response row belonging to the
-    same trajectory, so this function first creates one value per ``traj_uid``
-    and then exposes reward lookups for the SubAgent and Router deduplication
-    units.  It does not calculate credit or modify token-level rewards.
+    ``row_rewards`` contains the sum of each row's ``token_level_scores``:
+    task reward with any format penalty already applied. Copies of the same
+    response share one reward lookup; different calls in a trajectory retain
+    their individual rewards. KL is handled separately by the trainer.
     """
-    if len(traj_uids) != len(episode_rewards):
+    if len(row_rewards) != len(group_index["rollout_row_ids"]):
         raise ValueError(
-            "traj_uids and episode_rewards must have equal lengths, "
-            f"got {len(traj_uids)} and {len(episode_rewards)}."
+            "row_rewards and rollout_row_ids must have equal lengths, "
+            f"got {len(row_rewards)} and {len(group_index['rollout_row_ids'])}."
         )
 
-    trajectory_rewards: Dict[Any, Any] = {}
-    for traj_uid, reward in zip(traj_uids, episode_rewards):
-        normalized_traj_uid = _normalize_group_scalar(traj_uid)
-        if isinstance(reward, np.generic):
-            reward = reward.item()
-        trajectory_rewards.setdefault(normalized_traj_uid, reward)
-
     subagent_unit_rewards: Dict[Tuple[Tuple[Any, ...], Any], Any] = {}
-    for group_key, trajectory_units in group_index["subagent_groups"].items():
-        for traj_uid in trajectory_units:
-            subagent_unit_rewards[(group_key, traj_uid)] = trajectory_rewards[traj_uid]
+    for group_key, response_units in group_index["subagent_groups"].items():
+        for response_key, row_indices in response_units.items():
+            subagent_unit_rewards[(group_key, response_key)] = float(row_rewards[row_indices[0]])
 
     router_unit_rewards: Dict[Tuple[Any, ...], Any] = {}
     for group_key, decision_units in group_index["router_groups"].items():
-        for decision_key in decision_units:
-            traj_uid, _ = decision_key
-            router_unit_rewards[(group_key, decision_key)] = trajectory_rewards[traj_uid]
+        for decision_key, unit in decision_units.items():
+            router_unit_rewards[(group_key, decision_key)] = float(row_rewards[unit["row_indices"][0]])
 
     return {
         **group_index,
-        "trajectory_rewards": trajectory_rewards,
         "subagent_unit_rewards": subagent_unit_rewards,
         "router_unit_rewards": router_unit_rewards,
     }
 
 
 def compute_subagent_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute task-and-role-relative credit with one reward per trajectory.
+    """Compute task-and-role-relative credit with equal weight per real call.
 
-    The group mean is computed across unique ``traj_uid`` values in each
-    ``(uid, role)`` group. All calls of that role in one trajectory receive the
-    same scalar credit; this function does not broadcast credit to tokens.
+    The group mean is computed across distinct responses in each ``(uid, role)``
+    group. Padding copies count once. Each response receives its own reward
+    minus that mean; this function does not broadcast credit to tokens.
     """
     unit_rewards = group_index["subagent_unit_rewards"]
     unit_credits: Dict[Tuple[Tuple[Any, ...], Any], Any] = {}
     group_baselines: Dict[Tuple[Any, ...], Any] = {}
     row_credits: Dict[int, Any] = {}
 
-    for group_key, trajectory_units in group_index["subagent_groups"].items():
-        rewards = [unit_rewards[(group_key, traj_uid)] for traj_uid in trajectory_units]
+    for group_key, response_units in group_index["subagent_groups"].items():
+        rewards = [unit_rewards[(group_key, response_key)] for response_key in response_units]
         baseline = sum(rewards) / len(rewards)
         group_baselines[group_key] = baseline
-        for traj_uid, row_indices in trajectory_units.items():
-            credit = unit_rewards[(group_key, traj_uid)] - baseline
-            unit_credits[(group_key, traj_uid)] = credit
+        for response_key, row_indices in response_units.items():
+            credit = unit_rewards[(group_key, response_key)] - baseline
+            unit_credits[(group_key, response_key)] = credit
             for row_index in row_indices:
                 row_credits[row_index] = credit
 
@@ -359,9 +356,9 @@ def compute_router_credit(group_index: Dict[str, Any]) -> Dict[str, Any]:
 
         for decision_key, unit in decision_units.items():
             unit_key = (group_key, decision_key)
-            # Router credit is action-level: every trajectory choosing the
+            # Router credit is action-level: every decision choosing the
             # same action receives S_j - baseline, rather than its own
-            # trajectory reward minus the baseline.
+            # adjusted response reward minus the baseline.
             action = unit["selected_action"]
             credit = action_stats[action]["mean_reward"] - baseline
             unit_credits[unit_key] = credit
@@ -392,7 +389,7 @@ def normalize_router_subagent_credit(
 ) -> Dict[str, Any]:
     """Normalize SubAgent and Router credit within their own statistical groups.
 
-    Role standard deviations use unique trajectory credits within each
+    Role standard deviations use equally weighted real-call credits within each
     ``(uid, role)`` group. Router standard deviations use the empirical action
     probabilities within each ``(uid, parent_prefix_key)`` group. No response
     row duplication is used when calculating either scale.
@@ -403,14 +400,14 @@ def normalize_router_subagent_credit(
     subagent_unit_advantages: Dict[Tuple[Tuple[Any, ...], Any], Any] = {}
     subagent_group_stds: Dict[Tuple[Any, ...], Any] = {}
     subagent_row_advantages: Dict[int, Any] = {}
-    for group_key, trajectory_units in group_index["subagent_groups"].items():
-        credits = [subagent_unit_credits[(group_key, traj_uid)] for traj_uid in trajectory_units]
+    for group_key, response_units in group_index["subagent_groups"].items():
+        credits = [subagent_unit_credits[(group_key, response_key)] for response_key in response_units]
         variance = sum(credit * credit for credit in credits) / len(credits)
         std = math.sqrt(variance)
         subagent_group_stds[group_key] = std
         scale = std + epsilon if norm_adv_by_std_in_grpo else 1.0
-        for traj_uid, row_indices in trajectory_units.items():
-            unit_key = (group_key, traj_uid)
+        for response_key, row_indices in response_units.items():
+            unit_key = (group_key, response_key)
             advantage = subagent_unit_credits[unit_key] / scale
             subagent_unit_advantages[unit_key] = advantage
             for row_index in row_indices:
@@ -477,7 +474,7 @@ def build_router_subagent_group_index_from_batch(
         "selected_role",
         "env_step",
         "is_action_valid",
-        "episode_rewards",
+        "rollout_row_id",
     )
     missing_fields = [field for field in required_fields if field not in data.non_tensor_batch]
     if missing_fields:
@@ -494,13 +491,13 @@ def build_router_subagent_group_index_from_batch(
         selected_roles=non_tensor_batch["selected_role"],
         env_steps=non_tensor_batch["env_step"],
         is_action_valid=non_tensor_batch["is_action_valid"],
+        rollout_row_ids=non_tensor_batch["rollout_row_id"],
         router_agent_id=router_agent_id,
     )
-    return attach_episode_rewards_to_group_index(
-        group_index,
-        traj_uids=non_tensor_batch["traj_uid"],
-        episode_rewards=non_tensor_batch["episode_rewards"],
-    )
+    # Format penalties are already in token_level_scores. token_level_rewards
+    # can also contain KL, which this credit mode adds separately in the trainer.
+    row_rewards = data.batch["token_level_scores"].sum(dim=-1).detach().cpu().tolist()
+    return attach_training_rewards_to_group_index(group_index, row_rewards)
 
 
 def summarize_group_size(group_size: list):
