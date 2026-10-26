@@ -489,7 +489,7 @@ class RoleWorkerAgentTests(unittest.TestCase):
         self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(),
                          [True, False, False, False, True, True, True, True, False, False])
 
-    def test_search_uses_drmas_projection_and_preserves_raw_generation(self):
+    def test_search_separates_execution_from_format_and_preserves_raw_generation(self):
         agent = AgentRegistry.create(
             "SEARCH", wg_id="search-policy", tokenizer=None, processor=None,
             config=SimpleNamespace(env=SimpleNamespace(env_name="search")),
@@ -505,13 +505,21 @@ class RoleWorkerAgentTests(unittest.TestCase):
             "<think><search>quoted query</search></think><search>actual query</search>",
             "<think><answer>premature answer</answer></think><search>query</search>",
             "<think>One</think><think>Two</think><search>query</search>",
+            "<think>Unfinished reasoning<search>query</search>",
+            "<search>query</search><answer>premature answer</answer>",
+            "<search>query<search>nested</search></search>",
+            "<search>query</search> trailing text",
+            "<search>北京</search>",
+            "</search><search>reversed",
             "<think>Inactive</think><search>inactive query</search>",
         ]
         expected = [
             "<search>second query</search>", "<search>first query</search>", "",
             "<search>北京</search>", "<search></search>", "", "<search>first</search>",
             "<search>quoted query</search>", "<search>query</search>",
-            "<search>query</search>", "<search>inactive query</search>",
+            "<search>query</search>", "<search>query</search>", "<search>query</search>",
+            "<search>query<search>nested</search>", "<search>query</search>",
+            "<search>北京</search>", "<search></search>", "<search>inactive query</search>",
         ]
         size = len(responses)
         mask = np.array([True] * (size - 1) + [False])
@@ -528,7 +536,86 @@ class RoleWorkerAgentTests(unittest.TestCase):
         self.assertIs(batch.batch["responses"], raw_generation)
         self.assertEqual(returned_responses, expected)
         self.assertEqual(batch.non_tensor_batch["is_action_valid"].tolist(),
-                         [True, False, False, False, True, False, True, True, True, False, False])
+                         [True] + [False] * (size - 1))
+        self.assertEqual(batch.non_tensor_batch["search_executable"].tolist(),
+                         [True, True] + [False] * (size - 2))
+
+    def test_missing_think_query_reaches_environment_and_keeps_training_penalty(self):
+        from tests.agent_system.test_role_router_orchestra import FakeBatch, ScriptedEnvironment, collect
+        from tests.trainer.ppo import test_valid_action_training as training_support
+
+        roles = ["SEARCH", "ANSWER"]
+        config = SimpleNamespace(
+            agent=SimpleNamespace(role_ids=roles, orchestra_type="router", orchestra=SimpleNamespace(
+                router=SimpleNamespace(max_loop_num=2, max_context_runs=2))),
+            env=SimpleNamespace(env_name="search", max_steps=2),
+        )
+        names = ["Router Agent", *roles]
+        mapping = {name: f"policy:{name}" for name in names}
+        groups = {group: object() for group in mapping.values()}
+        with patch.dict(sys.modules, {"agent_system.agent.agents.router": router_package}):
+            orchestra = RouterOrchestra(
+                names, roles, ["checkpoint"] * len(names), mapping,
+                dict.fromkeys(groups), dict.fromkeys(groups), config,
+            )
+        raw_query = " \n<search> newborn infant first weeks </search>\n"
+        query = "<search>newborn infant first weeks</search>"
+        scripts = {
+            "Router Agent": deque([["<route>SEARCH</route>"], ["<route>ANSWER</route>"], ["<route>FINISH</route>"]]),
+            "SEARCH": deque([[raw_query]]),
+            "ANSWER": deque([["<think>The evidence names the term.</think><answer>neonate</answer>"]]),
+        }
+        prompts, search_batches = [], []
+
+        def preprocess(**kwargs):
+            prompts.extend(kwargs["obs"]["text"])
+            return FakeBatch(1)
+
+        def generate(name, batch, group, mask, meta_info):
+            self.assertIs(group, groups[mapping[name]])
+            responses = scripts[name].popleft()
+            batch.batch["responses"] = tuple(responses)
+            batch.non_tensor_batch["wg_id"] = np.full(1, mapping[name], dtype=object)
+            batch.non_tensor_batch["agent_active_mask"] = mask.copy()
+            if name == "SEARCH":
+                search_batches.append(batch)
+            return batch, responses
+
+        env = ScriptedEnvironment(["What is a newborn infant called?"], [
+            (["Retrieved evidence: a newborn infant is a neonate."], [0.0], [False]),
+            (None, [1.0], [True]),
+        ])
+        gen_batch = FakeBatch(1)
+        gen_batch.batch = np.zeros((1, 1))
+        gen_batch.meta_info = {}
+        collector = SimpleNamespace(config=config, multiagent_orchestra=orchestra)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(router_module, "preprocess_batch", side_effect=preprocess))
+            for role in roles:
+                stack.enter_context(patch.object(role_modules["search"][role], "preprocess_batch", side_effect=preprocess))
+            for name, agent in orchestra.agents.items():
+                stack.enter_context(patch.object(agent, "_generate_with_llm", side_effect=partial(generate, name)))
+            trajectories, rewards, *_ = collect(collector, gen_batch, groups, env, effective_rollout_n=1)
+
+        self.assertEqual(env.actions, [[query], ["<answer>neonate</answer>"]])
+        self.assertEqual(search_batches[0].batch["responses"], (raw_query,))
+        rows = trajectories[0]
+        self.assertEqual([item["agent_id"] for item in rows],
+                         ["Router Agent", "SEARCH", "Router Agent", "ANSWER", "Router Agent"])
+        self.assertEqual([item["search_executable"] for item in rows], [False, True, False, False, False])
+        self.assertEqual([item["is_action_valid"] for item in rows], [True, False, True, True, True])
+        self.assertEqual(rows[1]["return_reason"], "search")
+        self.assertTrue(all(set(item) == set(rows[0]) for item in rows))
+        self.assertTrue(any(query in prompt and "Retrieved evidence:" in prompt for prompt in prompts))
+        self.assertTrue(all(not script for script in scripts.values()))
+
+        # Use the collected validity flags with the real trainer penalty code.
+        batch = training_support.rollout(
+            [item["wg_id"] for item in rows], [item["is_action_valid"] for item in rows],
+        )
+        batch.batch["token_level_scores"] = training_support.tensor([[0.0, rewards[0]]] * len(rows))
+        training_support.load_driver()["apply_invalid_action_penalty"](batch, invalid_action_penalty_coef=0.1)
+        np.testing.assert_allclose(batch.batch["token_level_scores"].sum(dim=-1), [1.0, 0.9, 1.0, 1.0, 1.0])
 
     def test_orchestra_dispatches_real_agents_with_role_prompts_and_model_groups(self):
         for env_name, roles in (("math", ["SOLVE", "VERIFY", "REVISE"]),

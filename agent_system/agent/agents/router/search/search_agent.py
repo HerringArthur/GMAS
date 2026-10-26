@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from typing import Any, Dict, List, Tuple
+import re
 
 import numpy as np
 from transformers import PreTrainedTokenizer
@@ -55,6 +56,25 @@ search query enclosed within <search> </search>.
 """
 
 
+def _has_single_search_query(response: str) -> bool:
+    """Accept one nonempty query after optional, complete reasoning.
+
+    Missing reasoning is executable but remains a format error. Nested,
+    repeated, mixed or unfinished control tags must not be hidden by the
+    shared projection's extraction of the first search block.
+    """
+    match = re.fullmatch(
+        r"\s*(?:<think>(?P<thought>.*?)</think>\s*)?"
+        r"<search>(?P<query>.*?)</search>\s*",
+        response,
+        flags=re.DOTALL,
+    )
+    if match is None or not match.group("query").strip():
+        return False
+    content = (match.group("thought") or "") + match.group("query")
+    return re.search(r"</?(?:think|search|answer)\b", content, flags=re.IGNORECASE) is None
+
+
 @AgentRegistry.register("SEARCH")
 class SearchAgent(BaseAgent):
     """Generate a search request for the environment to execute."""
@@ -91,6 +111,20 @@ class SearchAgent(BaseAgent):
         )
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
 
+        # general_projection mutates its input list. Check execution against
+        # the original text so extraction cannot conceal malformed actions.
+        raw_responses = text_responses.copy()
+        _, query_valids = general_projection(
+            raw_responses.copy(),
+            start_tag=self.start_tag,
+            end_tag=self.end_tag,
+            check_think_tag=False,
+            return_tag=True,
+            return_whole_response=False,
+        )
+        query_valids &= np.array([_has_single_search_query(text) for text in raw_responses], dtype=bool)
+        query_valids &= agent_active_mask
+
         text_responses, valids = general_projection(
             text_responses,
             start_tag=self.start_tag,
@@ -99,7 +133,8 @@ class SearchAgent(BaseAgent):
             return_tag=True,
             return_whole_response=False,
         )
-        batch.non_tensor_batch["is_action_valid"] = valids & agent_active_mask
+        batch.non_tensor_batch["is_action_valid"] = valids & query_valids
+        batch.non_tensor_batch["search_executable"] = query_valids
         batch.non_tensor_batch["selected_role"] = np.full(len(text_responses), "", dtype=object)
         batch.non_tensor_batch["env_step"] = np.full(len(text_responses), step, dtype=object)
         return batch, text_responses

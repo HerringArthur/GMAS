@@ -38,7 +38,7 @@ class ScriptedAgent:
         self.calls = []
         self.reset_count = 0
 
-    def enqueue(self, responses, selections=None, valid=None):
+    def enqueue(self, responses, selections=None, valid=None, executable=None):
         batch = FakeBatch(len(responses))
         batch.batch["responses"] = tuple(responses)
         batch.non_tensor_batch["is_action_valid"] = np.array(
@@ -47,6 +47,10 @@ class ScriptedAgent:
         batch.non_tensor_batch["selected_role"] = np.array(
             selections if selections is not None else [""] * len(responses), dtype=object,
         )
+        if self.name == "SEARCH":
+            batch.non_tensor_batch["search_executable"] = np.array(
+                executable if executable is not None else batch.non_tensor_batch["is_action_valid"], dtype=bool,
+            )
         self.script.append((batch, responses))
         return batch
 
@@ -63,6 +67,8 @@ class ScriptedAgent:
         mask = kwargs["agent_active_mask"]
         metadata = batch.non_tensor_batch
         metadata["is_action_valid"] &= mask
+        if "search_executable" in metadata:
+            metadata["search_executable"] &= mask
         metadata["agent_active_mask"] = mask.copy()
         metadata["wg_id"] = np.full(len(batch), self.wg_id, dtype=object)
         metadata["env_step"] = np.full(len(batch), kwargs["step"], dtype=object)
@@ -172,8 +178,8 @@ class RoleRouterTests(unittest.TestCase):
             [f"Assignment: {role}" for role in selections], selections, valid,
         )
 
-    def respond(self, role, responses, valid=None):
-        return self.orchestra.agents[role].enqueue(responses, valid=valid)
+    def respond(self, role, responses, valid=None, executable=None):
+        return self.orchestra.agents[role].enqueue(responses, valid=valid, executable=executable)
 
     def run_round(self, active=(True,), step=1, observation=None):
         actions, buffer = self.orchestra.run(
@@ -511,15 +517,22 @@ class RoleRouterTests(unittest.TestCase):
                          [(), (), ("SEARCH",), ("SEARCH",), ("SEARCH",), ("SEARCH", "ANSWER")])
         self.assertEqual([row["parent_prefix_key"] for row in rows[1]], [(), (), ("ANSWER",)])
 
-    def test_search_pauses_only_valid_active_rows_and_keeps_their_requests(self):
+    def test_search_pauses_executable_active_rows_even_when_format_is_invalid(self):
         orchestra = self.make_orchestra(roles=("SEARCH",), env_name="search")
         self.route(["SEARCH"] * 3)
         query = "<search>first query</search>"
-        self.respond("SEARCH", [query, "broken request", "<search>inactive</search>"], valid=[True, False, True])
-        actions, _ = self.run_round(active=(True, True, False))
+        search_batch = self.respond(
+            "SEARCH", [query, "broken request", "<search>inactive</search>"],
+            valid=[False, False, False], executable=[True, False, True],
+        )
+        actions, buffer = self.run_round(active=(True, True, False))
         self.assertEqual(actions, [query, "", ""])
         self.assertEqual(orchestra.return_reasons.tolist(), ["search", "", ""])
+        self.assertEqual(search_batch.non_tensor_batch["is_action_valid"].tolist(), [False, False, False])
+        self.assertIn(query, "".join(orchestra.team_context[0]))
         self.assertNotIn("broken request", "".join(orchestra.team_context[1]))
+        self.assertEqual(orchestra.candidate_answers, ["", "", ""])
+        self.assertEqual(buffer[0]["batch"].non_tensor_batch["search_executable"].tolist(), [False] * 3)
 
         self.route(["SEARCH"] * 3)
         second_query = "<search>second query</search>"

@@ -30,17 +30,20 @@ Agent contract:
   instructions, which are passed to the selected role through team_context.
 * Each role has its own agent class and prompt. VERIFY is selected by scene.
   SEARCH and ANSWER use the shared general_projection checks and return only
-  the tagged search request or answer. Math SOLVE/REVISE use math_projection;
+  the tagged search request or answer. SEARCH additionally checks for one
+  nonempty query and supplies ``search_executable`` independently of format
+  validity, allowing a complete query without think tags to execute.
+  Math SOLVE/REVISE use math_projection;
   math VERIFY checks verify tags with general_projection. All math roles
   preserve complete responses. Search VERIFY checks for nonempty responses.
   Role agents supply an empty ``selected_role`` field.
   This module does not parse model-generated tags.
   Orchestra attaches ``parent_prefix_key`` to each batch for Router credit.
   Role credit uses the task and role identity, independently of this prefix.
-  All valid role responses update team_context. Only
+  Valid role responses and executable SEARCH queries update team_context. Only
   SOLVE/REVISE in math and SEARCH/ANSWER in search update text_actions. Answer
   roles also save candidate_answers, which FINISH copies into text_actions.
-  A valid SEARCH response in the search scene pauses that sample for environment execution.
+  An executable SEARCH query pauses that sample for environment execution.
 
 Example configuration, alongside a matching agent-to-worker-group mapping::
 
@@ -124,7 +127,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
     Candidate answers persist independently until reset() starts a new rollout.
     Role paths also persist for Router credit, independently of history eviction.
     initialize_context() clears pending actions and return reasons for each
-    environment step. FINISH and valid SEARCH responses mark samples ready for
+    environment step. FINISH and executable SEARCH queries mark samples ready for
     the next environment interaction.
     """
 
@@ -165,6 +168,15 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.candidate_answers = None
         self.return_reasons = None
         self.role_paths = None
+
+    def save_to_buffer(self, name: str, batch: DataProto):
+        # All role rows need the same metadata columns when the collector
+        # collates them. Non-SEARCH calls never carry an executable query.
+        batch.non_tensor_batch.setdefault(
+            "search_executable",
+            np.zeros_like(batch.non_tensor_batch["is_action_valid"], dtype=bool),
+        )
+        super().save_to_buffer(name, batch)
 
     def initialize_context(self, env_obs):
         """Start an environment step, retaining team context and candidate answers."""
@@ -253,8 +265,12 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
                 self.role_paths[i] += (role,)
             batch.non_tensor_batch["parent_prefix_key"] = parent_prefix_keys.copy()
             valid_mask = role_mask & batch.non_tensor_batch["is_action_valid"]
+            is_search = scene == "search" and role == "SEARCH"
+            usable_mask = valid_mask
+            if is_search:
+                usable_mask = role_mask & batch.non_tensor_batch["search_executable"]
             self.team_context = update_team_context(
-                role, self.team_context, responses, valid_mask,
+                role, self.team_context, responses, usable_mask,
                 step=step, max_context_runs=self.max_context_runs,
             )
             update_answer = (
@@ -264,10 +280,10 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             )
             if update_answer:
                 self.candidate_answers = update_text_action(self.candidate_answers, responses, valid_mask)
-            if update_answer or (scene == "search" and role == "SEARCH"):
-                self.text_actions = update_text_action(self.text_actions, responses, valid_mask)
-            if scene == "search" and role == "SEARCH":
-                self.return_reasons[valid_mask] = "search"
+            if update_answer or is_search:
+                self.text_actions = update_text_action(self.text_actions, responses, usable_mask)
+            if is_search:
+                self.return_reasons[usable_mask] = "search"
             self.save_to_buffer(role, batch)
 
         return self.text_actions.copy(), self.multiagent_batch_buffer
