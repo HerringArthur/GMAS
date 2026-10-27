@@ -155,22 +155,22 @@ class TrainingBenchmark:
         print(f"[benchmark] step={step}: saved {len(samples)} trajectories to {path}.txt", flush=True)
         return metrics
 
-    def record_step(self, metrics, step, training_batch):
+    def record_step(self, metrics, step, training_batch=None):
         """Save standard step timing, explicit observation cost, and padding counts."""
         step_s = float(metrics["timing_s/step"])
         dump_s = float(metrics.get("timing_s/dump_rollout_samples", 0.0))
         if not math.isfinite(step_s) or step_s <= 0 or not 0 <= dump_s < step_s:
             raise ValueError(f"Invalid benchmark timing: step={step_s}, sample_dump={dump_s}")
-        training_counts = Counter(str(wg) for wg in training_batch.non_tensor_batch["wg_id"])
+        training_counts = Counter(str(wg) for wg in training_batch.non_tensor_batch["wg_id"]) if training_batch is not None else Counter()
         # Training retains invalid outputs too; only rows beyond the complete
         # pre-padding rollout are copies. Validity counts are separate metrics.
         for wg, count in training_counts.items():
             metrics[f"benchmark/training_rows/{wg}"] = count
             source_count = metrics[f"benchmark/rollout_rows/{wg}"]
             metrics[f"benchmark/copied_rows/{wg}"] = count - source_count
-        metrics["benchmark/training_rows"] = len(training_batch)
+        metrics["benchmark/training_rows"] = len(training_batch) if training_batch is not None else 0
         source_rows = metrics["benchmark/rollout_rows"]
-        metrics["benchmark/copied_rows"] = len(training_batch) - source_rows
+        metrics["benchmark/copied_rows"] = len(training_batch) - source_rows if training_batch is not None else 0
         metrics["benchmark/step_excluding_samples_s"] = step_s - dump_s
         metrics["benchmark/questions_per_s"] = metrics["benchmark/questions"] / step_s
         row = {

@@ -266,6 +266,7 @@ algorithm:
     max_num_gen_batches: 10
 
 trainer:
+  rollout_only: False # fixed models: collect real trajectories without updates/checkpoints
   balance_batch: True
   total_epochs: 30
   total_training_steps: null

@@ -208,23 +208,28 @@ def make_envs(config):
     group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
     # Get validation rollout n for pass@k and avg@k computation
     val_group_n = getattr(config.env.rollout, 'val_n', 1)
+    rollout_only = config.trainer.get("rollout_only", False)
 
     if "math" in config.env.env_name.lower():
         from agent_system.environments.env_package.math import build_math_envs, math_projection
         _envs = build_math_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True)
-        _val_envs = build_math_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=val_group_n, is_train=False)
         
         projection_f = partial(math_projection)
         envs = MathEnvironmentManager(_envs, projection_f, config)
+        if rollout_only:
+            return envs, None
+        _val_envs = build_math_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=val_group_n, is_train=False)
         val_envs = MathEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     elif "search" in config.env.env_name.lower():
         from agent_system.environments.env_package.search import build_search_envs, search_projection
         _envs = build_search_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_config=config.env)
-        _val_envs = build_search_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=val_group_n, is_train=False, env_config=config.env)
 
         projection_f = partial(search_projection)
         envs = SearchEnvironmentManager(_envs, projection_f, config)
+        if rollout_only:
+            return envs, None
+        _val_envs = build_search_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=val_group_n, is_train=False, env_config=config.env)
         val_envs = SearchEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     else:

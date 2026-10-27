@@ -465,6 +465,7 @@ class RayPPOTrainer:
         self.tokenizers = tokenizers
         self.processors = processors
         self.config = config
+        self.rollout_only = config.trainer.get("rollout_only", False)
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
         self.envs = envs
@@ -501,10 +502,12 @@ class RayPPOTrainer:
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
-        if config.algorithm.use_kl_in_reward:
+        if config.algorithm.use_kl_in_reward and not self.rollout_only:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
 
-        if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+        if self.rollout_only:
+            self.use_critic = False
+        elif self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,
@@ -543,6 +546,14 @@ class RayPPOTrainer:
                     ) from e
 
     def _validate_config(self, config):
+        if self.rollout_only:
+            if config.actor_rollout_ref.actor.strategy not in ("fsdp", "fsdp2"):
+                raise ValueError("rollout_only currently requires FSDP workers")
+            if config.actor_rollout_ref.rollout.get("mode", "sync") != "sync":
+                raise ValueError("rollout_only currently requires synchronous rollout workers")
+            if config.data.get("gen_batch_size", config.data.train_batch_size) != config.data.train_batch_size:
+                raise ValueError("Collection gen_batch_size must match train_batch_size used by the environments")
+            return
         # config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
@@ -664,7 +675,7 @@ class RayPPOTrainer:
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizers[self.default_wg], self.processors[self.default_wg])
-        if val_dataset is None:
+        if val_dataset is None and not self.rollout_only:
             val_dataset = create_rl_dataset(self.config.data.val_files, self.config.data, self.tokenizers[self.default_wg], self.processors[self.default_wg])
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
@@ -683,6 +694,22 @@ class RayPPOTrainer:
             collate_fn=collate_fn,
             sampler=train_sampler,
         )
+
+        if self.rollout_only:
+            assert len(self.train_dataloader) >= 1, "Collection dataloader is empty; reduce data.train_batch_size."
+            self.val_dataloader = None
+            requested = self.config.trainer.total_training_steps
+            self.total_training_steps = (
+                len(self.train_dataloader) * self.config.trainer.total_epochs
+                if requested is None else requested
+            )
+            available = len(self.train_dataloader) * self.config.trainer.total_epochs
+            if not 0 < self.total_training_steps <= available:
+                raise ValueError(f"Collection requests {self.total_training_steps} batches but dataset/epochs provide {available}")
+            settings = self.config.trainer.benchmark
+            if not 0 <= settings.warmup_steps < self.total_training_steps:
+                raise ValueError("Collection requires 0 <= benchmark.warmup_steps < batch count")
+            return
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
@@ -956,6 +983,8 @@ class RayPPOTrainer:
         """
         if self.total_training_steps <= 0:
             raise ValueError(f"total_training_steps must be positive, got {self.total_training_steps}")
+        rollout_only = self.config.trainer.get("rollout_only", False)
+        worker_prefix = "rollout" if rollout_only else "actor_rollout"
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -967,14 +996,15 @@ class RayPPOTrainer:
             wg_configs[wg_id].model.path = agents_list[0]["model_id"]
             # These configs were copied before the dataloader determined the
             # training horizon. Each update_actor() advances the scheduler once.
-            for agent in agents_list:
-                agent["config_actor_rollout_ref"].actor.optim.total_training_steps = self.total_training_steps
+            if not rollout_only:
+                for agent in agents_list:
+                    agent["config_actor_rollout_ref"].actor.optim.total_training_steps = self.total_training_steps
 
         # create actor and rollout
         if self.hybrid_engine:
             for wg_id, agents_list in self.wg_to_agents_mapping.items():
                 resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-                role_name = "actor_rollout/" + "+".join(normalize_agent_id(agent_model["agent_id"]) for agent_model in agents_list) + "/"
+                role_name = worker_prefix + "/" + "+".join(normalize_agent_id(agent_model["agent_id"]) for agent_model in agents_list) + "/"
                 actor_rollout_cls = RayClassWithInitArgs(
                     cls=self.role_worker_mapping[Role.ActorRollout],
                     config=wg_configs[wg_id],
@@ -1042,7 +1072,7 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = {}
         for wg_id, agents_list in self.wg_to_agents_mapping.items():
-            role_name = "actor_rollout/" + "+".join(normalize_agent_id(agent_model["agent_id"]) for agent_model in agents_list) + "/"
+            role_name = worker_prefix + "/" + "+".join(normalize_agent_id(agent_model["agent_id"]) for agent_model in agents_list) + "/"
             assert role_name in all_wg, f"Role {role_name} not found in all_wg"
             actor_rollout_wg = all_wg[role_name]
             actor_rollout_wg.init_model()
@@ -1148,6 +1178,25 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _collect_rollout_batch(self, batch_dict):
+        """Use the same prompts, sampling policy and collaboration as training."""
+        batch = DataProto.from_single_dict(batch_dict)
+        question_count = len(batch)
+        non_tensor_keys = ["raw_prompt_ids", "data_source"]
+        non_tensor_keys.extend(key for key in ("multi_modal_data", "raw_prompt", "tools_kwargs", "env_kwargs")
+                               if key in batch.non_tensor_batch)
+        gen_batch = batch.pop(
+            batch_keys=["input_ids", "attention_mask", "position_ids"],
+            non_tensor_batch_keys=non_tensor_keys,
+        )
+        # is_train selects env.rollout.n and normal sampling settings, not
+        # gradient updates. Dynamic reward-group filtering is disabled at startup.
+        rollout = self.traj_collector.multi_turn_loop(
+            gen_batch=gen_batch, actor_rollout_wg=self.actor_rollout_wg,
+            envs=self.envs, is_train=True,
+        )
+        return rollout, question_count
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1157,6 +1206,13 @@ class RayPPOTrainer:
         """
         from omegaconf import OmegaConf
 
+        if self.config.trainer.get("rollout_only", False):
+            from verl.trainer.ppo.rollout_collection import collect_rollouts
+
+            return collect_rollouts(
+                OmegaConf.to_container(self.config, resolve=True),
+                self.train_dataloader, self.tokenizers, self._collect_rollout_batch,
+            )
         from verl.utils.tracking import Tracking
 
         logger = Tracking(

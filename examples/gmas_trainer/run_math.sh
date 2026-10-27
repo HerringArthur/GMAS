@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Usage: bash examples/gmas_trainer/run_math.sh [train|eval|evaluation] [Hydra overrides...]
-source /data/workspace/xuhaobin/miniconda3/etc/profile.d/conda.sh
-conda activate DrMAS
+# Activate the GMAS environment in the caller/sbatch job first.
+# DATA_DIR and MODEL_DIR can override the dataset and model paths.
 
 set -euo pipefail
 set -x
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 source examples/trainer_logging.sh
+data_dir="${DATA_DIR:-$HOME/data/drmas_math}"
 
 MODE=${1:-train}
 if [ "$#" -gt 0 ]; then
@@ -23,16 +24,16 @@ esac
 if [ "$MODE" == "eval" ] || [ "$MODE" == "evaluation" ]; then
     echo "Running in evaluation mode"
     VAL_ONLY=True
-    TRAIN_DATA="$HOME/data/drmas_math/train.parquet"
-    VAL_DATA="$HOME/data/drmas_math/test.parquet" # Full test dataset
+    TRAIN_DATA="$data_dir/train.parquet"
+    VAL_DATA="$data_dir/test.parquet" # Full test dataset
     train_data_size=32
     val_data_size=64
     val_group_size=16  # For pass@16 and avg@16 computation during evaluation
 else
     echo "Running in training mode"
     VAL_ONLY=False
-    TRAIN_DATA="$HOME/data/drmas_math/train.parquet"
-    VAL_DATA="$HOME/data/drmas_math/test_sampled.parquet" # For fast validation during training (test_sampled.parquet contains 50 examples from MATH500, 30 examples from AIME2024, and 30 examples from AIME2025)
+    TRAIN_DATA="$data_dir/train.parquet"
+    VAL_DATA="$data_dir/test_sampled.parquet" # For fast validation during training (test_sampled.parquet contains 50 examples from MATH500, 30 examples from AIME2024, and 30 examples from AIME2025)
     train_data_size=32
     val_data_size=110
     val_group_size=1
@@ -51,7 +52,8 @@ use_kl_in_reward=False
 env_name=math
 role_ids='["SOLVE","VERIFY","REVISE"]'
 agent_ids='["Router Agent","SOLVE","VERIFY","REVISE"]'
-model_ids='["Qwen/Qwen3-4B","Qwen/Qwen3-4B","Qwen/Qwen3-4B","Qwen/Qwen3-4B"]'
+model_path="${MODEL_DIR:-Qwen/Qwen3-4B}"
+model_ids="[\"$model_path\",\"$model_path\",\"$model_path\",\"$model_path\"]"
 model_sharing=False
 
 orchestra_type=router

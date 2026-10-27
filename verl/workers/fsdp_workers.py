@@ -529,7 +529,7 @@ class ActorRolloutRefWorker(Worker):
                 fsdp_config = self.config.actor.fsdp_config
             else:
                 optim_config = None
-                fsdp_config = OmegaConf.create()
+                fsdp_config = self.config.actor.fsdp_config
 
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
             (
@@ -550,6 +550,10 @@ class ActorRolloutRefWorker(Worker):
                 role="actor",
                 enable_activation_offload=self.config.model.get("enable_activation_offload", False),
             )
+
+            if not self._is_actor:
+                self.actor_module_fsdp.requires_grad_(False)
+                self.actor_module_fsdp.eval()
 
             # get the original unwrapped module
             if fsdp_version(self.actor_module_fsdp) == 1:

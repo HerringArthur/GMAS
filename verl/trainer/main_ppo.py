@@ -53,6 +53,10 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
+        from verl.trainer.ppo.rollout_collection import configure_rollout_only
+
+        configure_rollout_only(config)
+        rollout_only = config.trainer.get("rollout_only", False)
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
 
@@ -167,7 +171,7 @@ class TaskRunner:
 
         default_wg = list(wg_to_agents_mapping.keys())[0] # default model is the first one in model_ids
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizers[default_wg], processors[default_wg])
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizers[default_wg], processors[default_wg])
+        val_dataset = None if rollout_only else create_rl_dataset(config.data.val_files, config.data, tokenizers[default_wg], processors[default_wg])
         train_sampler = create_rl_sampler(config.data, train_dataset)
         trainer = RayPPOTrainer(
             config=config,
