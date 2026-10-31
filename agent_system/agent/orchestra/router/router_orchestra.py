@@ -24,20 +24,13 @@ Agent contract:
   ``wg_id`` and ``env_step`` for each input row. Inactive rows are invalid.
   Each call receives the latest ``candidate_answers`` separately from history,
   so agents can read a candidate even when its original history entry is absent.
-* RouterAgent additionally returns ``non_tensor_batch['selected_role']``: an
-  exact configured role name or ``FINISH``, and marks other selections invalid
-  through ``is_action_valid``. Its text contains any assignment
-  instructions, which are passed to the selected role through team_context.
-* Each role has its own agent class and prompt. VERIFY is selected by scene.
-  SEARCH and ANSWER use the shared general_projection checks and return only
-  the tagged search request or answer. SEARCH additionally checks for one
-  nonempty query and supplies ``search_executable`` independently of format
-  validity, allowing a complete query without think tags to execute.
-  Math SOLVE/REVISE use math_projection;
-  math VERIFY checks verify tags with general_projection. All math roles
-  preserve complete responses. Search VERIFY checks for nonempty responses.
-  Role agents supply an empty ``selected_role`` field.
-  This module does not parse model-generated tags.
+* Agents parse one model-generated function call and attach action_name,
+  action_args and action_error without altering sampled response tokens.
+  RouterAgent maps call_agent/finish to selected_role for existing credit.
+  Role responses are rendered for context and the existing environment API.
+  Router task arguments are passed explicitly through the role context.
+  Execution and state checks happen here, after parsing, with errors fed back
+  to the next Router decision. Reviews retain their candidate/environment version.
   Orchestra attaches ``parent_prefix_key`` to each batch for Router credit.
   Role credit uses the task and role identity, independently of this prefix.
   Valid role responses and executable SEARCH queries update team_context. Only
@@ -83,7 +76,7 @@ def update_team_context(
     """Keep the latest runs directly in each sample's team context.
 
     Router starts a run; its selected role appends to the same entry. Invalid
-    Router responses are passed as empty strings so attempts still count.
+    actions contribute execution feedback, and attempts still count.
     """
     if agent_active_mask is None:
         agent_active_mask = np.ones(len(team_context), dtype=bool)
@@ -93,7 +86,8 @@ def update_team_context(
             if agent_id == "Router Agent":
                 team_context[i].append(f'\n[Environment step {step}]\n' if text_response[i] else "")
             if text_response[i]:
-                team_context[i][-1] += f'\nThe output of "{agent_id}": {text_response[i]}\n'
+                label = "Execution feedback for" if text_response[i].startswith("ActionError:") else "The output of"
+                team_context[i][-1] += f'\n{label} "{agent_id}": {text_response[i]}\n'
             team_context[i] = team_context[i][-max_context_runs:]
     return team_context
 
@@ -160,6 +154,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.candidate_answers = None
         self.return_reasons = None
         self.role_paths = None
+        self.candidate_versions = None
+        self.reviews = None
 
     def reset(self):
         super().reset()
@@ -168,6 +164,8 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         self.candidate_answers = None
         self.return_reasons = None
         self.role_paths = None
+        self.candidate_versions = None
+        self.reviews = None
 
     def save_to_buffer(self, name: str, batch: DataProto):
         # All role rows need the same metadata columns when the collector
@@ -175,6 +173,11 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         batch.non_tensor_batch.setdefault(
             "search_executable",
             np.zeros_like(batch.non_tensor_batch["is_action_valid"], dtype=bool),
+        )
+        batch.non_tensor_batch["candidate_version"] = np.array(self.candidate_versions, dtype=object)
+        batch.non_tensor_batch["candidate_review"] = np.fromiter(
+            (dict(review) if review is not None else None for review in self.reviews),
+            dtype=object, count=len(self.reviews),
         )
         super().save_to_buffer(name, batch)
 
@@ -187,9 +190,22 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             self.candidate_answers = [""] * len(text_actions)
         if self.role_paths is None:
             self.role_paths = [()] * len(text_actions)
+        if self.candidate_versions is None:
+            self.candidate_versions = [0] * len(text_actions)
+            self.reviews = [None] * len(text_actions)
         self.text_actions = text_actions
         self.return_reasons = np.full(len(self.text_actions), "", dtype=object)
         return self.text_actions, ["".join(runs) for runs in self.team_context], env_obs
+
+    @staticmethod
+    def _feedback(batch, responses, mask):
+        """Keep execution errors visible without treating them as model output."""
+        metadata = batch.non_tensor_batch
+        return [
+            (responses[i] if metadata["is_action_valid"][i]
+             else "ActionError: " + metadata["action_error"][i]) if active else ""
+            for i, active in enumerate(mask)
+        ]
 
     def run(
         self,
@@ -208,6 +224,16 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
 
         # 1. Route each pending sample once, using work from preceding calls.
         prompt_context = ["".join(runs) for runs in self.team_context]
+        for i, review in enumerate(self.reviews):
+            if review is not None:
+                prompt_context[i] += (
+                    "\n# Latest Recorded Review\n"
+                    f"Reviewed candidate version: {review['candidate_version']}; "
+                    f"current candidate version: {self.candidate_versions[i]}. "
+                    f"Reviewed environment step: {review['env_step']}; current step: {step}.\n"
+                    f"Assessment: {review['assessment']}\n"
+                    "A review of an earlier candidate or evidence state must be reassessed.\n"
+                )
         actor_rollout_wg = actor_rollout_wgs[self.agents_to_wg_mapping[self.ROUTER_AGENT]]
         router_batch, router_responses = self.agents[self.ROUTER_AGENT].call(
             gen_batch=gen_batch,
@@ -222,14 +248,25 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         finish_mask = selections == self.FINISH
         route_mask = pending_mask & router_batch.non_tensor_batch["is_action_valid"]
         scene = self.config.env.env_name
-        if scene == "search" and step == self.config.env.max_steps:
-            route_mask &= selections != "SEARCH"
+        metadata = router_batch.non_tensor_batch
+        for i in np.flatnonzero(route_mask):
+            error = ""
+            if selections[i] == self.FINISH and not self.candidate_answers[i].strip():
+                error = "finish() requires a saved candidate answer; call an answer-producing role first."
+            elif scene == "search" and step == self.config.env.max_steps and selections[i] == "SEARCH":
+                error = "SEARCH is unavailable on the final environment step."
+            if error:
+                route_mask[i] = False
+                metadata["action_error"][i] = error
+                metadata["execution_status"][i] = "state_error"
+            else:
+                metadata["execution_status"][i] = "submitted" if finish_mask[i] else "dispatched"
         router_batch.non_tensor_batch["is_action_valid"] = route_mask
         parent_prefix_keys = np.fromiter(self.role_paths, dtype=object, count=len(self.role_paths))
         router_batch.non_tensor_batch["parent_prefix_key"] = parent_prefix_keys
         self.team_context = update_team_context(
             self.ROUTER_AGENT, self.team_context,
-            np.where(route_mask, router_responses, "").tolist(),
+            self._feedback(router_batch, router_responses, pending_mask),
             agent_active_mask=pending_mask, step=step, max_context_runs=self.max_context_runs,
         )
         # The role sees the same prior runs as the Router plus its new assignment,
@@ -238,6 +275,9 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             context + self.team_context[i][-1] if pending_mask[i] else context
             for i, context in enumerate(prompt_context)
         ]
+        for i in np.flatnonzero(route_mask & ~finish_mask):
+            task = metadata["routing_instruction"][i]
+            prompt_context[i] += f"\n# Router Assignment\nSelected role: {selections[i]}\nTask: {task or 'Perform your role for the current task.'}\n"
         self.save_to_buffer(self.ROUTER_AGENT, router_batch)
         submit_mask = route_mask & finish_mask
         self.text_actions = update_text_action(self.text_actions, self.candidate_answers, submit_mask)
@@ -268,9 +308,18 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             is_search = scene == "search" and role == "SEARCH"
             usable_mask = valid_mask
             if is_search:
-                usable_mask = role_mask & batch.non_tensor_batch["search_executable"]
+                usable_mask = valid_mask & batch.non_tensor_batch["search_executable"]
+            role_metadata = batch.non_tensor_batch
+            for i in np.flatnonzero(usable_mask):
+                role_metadata["execution_status"][i] = "queued" if is_search else "applied"
+                if role_metadata["action_name"][i] == "record_review":
+                    self.reviews[i] = {
+                        "candidate_version": self.candidate_versions[i],
+                        "env_step": step,
+                        "assessment": dict(role_metadata["action_args"][i]),
+                    }
             self.team_context = update_team_context(
-                role, self.team_context, responses, usable_mask,
+                role, self.team_context, self._feedback(batch, responses, role_mask), role_mask,
                 step=step, max_context_runs=self.max_context_runs,
             )
             update_answer = (
@@ -280,6 +329,11 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             )
             if update_answer:
                 self.candidate_answers = update_text_action(self.candidate_answers, responses, valid_mask)
+                for i in np.flatnonzero(valid_mask):
+                    self.candidate_versions[i] += 1
+                    explanation = role_metadata["action_args"][i].get("explanation", "")
+                    if explanation:
+                        self.team_context[i][-1] += f"\nAnswer explanation: {explanation}\n"
             if update_answer or is_search:
                 self.text_actions = update_text_action(self.text_actions, responses, usable_mask)
             if is_search:

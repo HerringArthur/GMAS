@@ -15,11 +15,11 @@
 
 from typing import Any, Dict, List, Tuple
 
-import numpy as np
 from transformers import PreTrainedTokenizer
 from verl import DataProto
 
 from agent_system.agent.agents.base import BaseAgent
+from agent_system.code_actions import action_instructions, project_code_actions
 from agent_system.multi_turn_rollout.utils import preprocess_batch
 
 
@@ -53,10 +53,11 @@ Your responsibilities:
 - Assess whether the available information is complete and sufficient to generate a high-quality answer.
 - If a candidate answer is available, check whether it is supported by the retrieved evidence.
 
-You are now at step {step}. You should first reason step-by-step about the past
-events. After completing your reasoning, give your assessment:
-(1) If the information is sufficient to answer the question: return <verify>yes</verify>
-(2) If the information is insufficient to answer the question: return <verify>no</verify>
+Call record_review(sufficient=False, feedback="Your assessment and evidence").
+Set sufficient=True only if the supplied evidence is sufficient to answer the
+question; otherwise use False. Distinguish missing evidence from a search that
+returned no results, and check the candidate against the actual evidence.
+Your review updates shared state; it does not replace the candidate or submit it.
 """
 
 
@@ -71,6 +72,7 @@ class VerifierAgent(BaseAgent):
             processor=processor,
             config=config,
         )
+        self.prompt += action_instructions("VERIFY", "search")
 
     def call(
         self,
@@ -93,10 +95,7 @@ class VerifierAgent(BaseAgent):
         )
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
 
-        batch.non_tensor_batch["is_action_valid"] = np.array(
-            [active and bool(response.strip()) for response, active in zip(text_responses, agent_active_mask)],
-            dtype=bool,
+        return project_code_actions(
+            batch, text_responses, agent_active_mask,
+            role=self.name, scene="search", step=step,
         )
-        batch.non_tensor_batch["selected_role"] = np.full(len(text_responses), "", dtype=object)
-        batch.non_tensor_batch["env_step"] = np.full(len(text_responses), step, dtype=object)
-        return batch, text_responses

@@ -91,6 +91,7 @@ class SearchEnv(BaseTextEnv):
         self.chat_history.append({"role": "assistant", "content": action})
 
         error = None
+        query = [None]
         if not self.done:
             done = self._is_done(action)
             self.done = done
@@ -122,7 +123,8 @@ class SearchEnv(BaseTextEnv):
             new_obs = None
 
         info = {
-            "tool_calling": True,
+            "tool_calling": bool(query[0] and query[0].strip()),
+            "tool_status": "execution_error" if error else getattr(self.tool_group, "last_status", "not_called"),
             "tool_group": "SearchToolGroup",
             "tool_name": "search",
             "tool_input": query,

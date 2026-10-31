@@ -15,13 +15,12 @@
 
 from typing import Any, Dict, List, Tuple
 
-import numpy as np
 from transformers import PreTrainedTokenizer
 from verl import DataProto
 
 from agent_system.agent.agents.base import BaseAgent
+from agent_system.code_actions import action_instructions, project_code_actions
 from agent_system.agent.registry import AgentRegistry
-from agent_system.agent.utils import general_projection
 from agent_system.multi_turn_rollout.utils import preprocess_batch
 
 
@@ -48,10 +47,9 @@ answer to the question. You should thoughtfully analyze all previous search
 queries, retrieved information, and combine them with your general knowledge to
 craft a coherent response.
 
-You should first conduct a reasoning process. This process MUST be enclosed
-within <think> </think> tags.
-After completing your reasoning, provide your final answer within <answer> </answer>
-tags. For example, <answer>Beijing</answer>.
+Call save_candidate(answer="...", explanation="...") to save your answer.
+The explanation is optional. Saving does not submit the answer; the Router
+will decide whether to review it or finish. Use only your own available function.
 """
 
 
@@ -67,8 +65,7 @@ class AnswerAgent(BaseAgent):
             processor=processor,
             config=config,
         )
-        self.start_tag = "<answer>"
-        self.end_tag = "</answer>"
+        self.prompt += action_instructions("ANSWER", "search")
 
     def call(
         self,
@@ -91,15 +88,7 @@ class AnswerAgent(BaseAgent):
         )
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
 
-        text_responses, valids = general_projection(
-            text_responses,
-            start_tag=self.start_tag,
-            end_tag=self.end_tag,
-            check_think_tag=True,
-            return_tag=True,
-            return_whole_response=False,
+        return project_code_actions(
+            batch, text_responses, agent_active_mask,
+            role=self.name, scene="search", step=step,
         )
-        batch.non_tensor_batch["is_action_valid"] = valids & agent_active_mask
-        batch.non_tensor_batch["selected_role"] = np.full(len(text_responses), "", dtype=object)
-        batch.non_tensor_batch["env_step"] = np.full(len(text_responses), step, dtype=object)
-        return batch, text_responses

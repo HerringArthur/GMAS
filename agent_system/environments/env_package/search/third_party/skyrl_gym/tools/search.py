@@ -186,7 +186,7 @@ class SearchToolGroup(ToolGroup):
 
     @tool
     def search(self, query: str) -> str:
-        # NOTE(shu): add warning messages here?
+        self.last_status = "not_called"
         if query is None:
             return ""
 
@@ -258,4 +258,5 @@ class SearchToolGroup(ToolGroup):
             result_text = json.dumps({"result": "Unknown API state (no response and no error message)."})
             logger.error("Batch search: Unknown API state.")
 
+        self.last_status = metadata["status"]
         return result_text

@@ -50,6 +50,8 @@ class TrainingBenchmark:
         "routed_agent", "routing_instruction", "router_feedback", "return_reason",
         "candidate_answer", "candidate_author", "candidate_repeat_count", "candidate_evidence",
         "candidate_quality", "candidate_review", "last_worker_decision", "protocol_repaired", "rewards",
+        "action_name", "action_args", "action_error", "execution_status", "search_executable",
+        "candidate_version", "environment_action", "environment_result",
     )
     EPISODE_FIELDS = ("uid", "episode_rewards", "episode_lengths", "tool_callings", "pass", "data_source")
 

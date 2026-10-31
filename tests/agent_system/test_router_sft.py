@@ -96,7 +96,7 @@ class RouterSFTTests(unittest.TestCase):
         messages, _ = sft.decode_input(source['input'])
         example = sft.convert_record(source)
         self.assertEqual(example['messages'][:-1], messages)
-        self.assertEqual(example['messages'][-1], {'role': 'assistant', 'content': '<route>SEARCH</route>'})
+        self.assertEqual(example['messages'][-1], {'role': 'assistant', 'content': "call_agent(role='SEARCH', task='')"})
         self.assertEqual(example['episode_pass'], 0)
         source['selected_role'] = 'ANSWER'
         self.assertEqual(sft.convert_record(source)['route'], 'SEARCH')
@@ -129,10 +129,10 @@ class RouterSFTTests(unittest.TestCase):
     def test_qwen_prefills_are_restored_and_unknown_templates_rejected(self):
         source = record('We need evidence.</think>\nSEARCH')
         source['input'] += '<think>\n'
-        self.assertEqual(sft.convert_record(source)['messages'][-1]['content'], '<think>We need evidence.</think>\n<route>SEARCH</route>')
+        self.assertEqual(sft.convert_record(source)['messages'][-1]['content'], "call_agent(role='SEARCH', task='We need evidence.')")
         source = record('SOLVE', scene='math')
         source['input'] += '<think>\n\n</think>\n\n'
-        self.assertEqual(sft.convert_record(source)['messages'][-1]['content'], '<think></think>\n<route>SOLVE</route>')
+        self.assertEqual(sft.convert_record(source)['messages'][-1]['content'], "call_agent(role='SOLVE', task='')")
         source['input'] = 'truncated input'
         with self.assertRaisesRegex(sft.Rejected, 'chat_template'):
             sft.convert_record(source)
@@ -213,13 +213,26 @@ class RouterSFTTests(unittest.TestCase):
             sft.convert_record({'scene': 'search', 'route': 'ANSWER', 'messages': []})
 
     def test_outputs_match_the_production_router_parser(self):
-        # Use the actual parser pattern without importing GPU/training modules.
-        tree = ast.parse((ROOT / 'agent_system/agent/agents/router/router_agent.py').read_text())
-        pattern = next(ast.literal_eval(node.args[0]) for node in ast.walk(tree)
-                       if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'fullmatch')
-        for raw in ('SEARCH', '<Route>VERIFY</Route>', 'THINK: Fix the calculation.\nREVISE', 'ROUTES: FINISH'):
-            fixed = sft.repair_response(raw)
-            self.assertEqual(re.fullmatch(pattern, fixed['response'], re.S)[1], fixed['route'])
+        for raw in ('SEARCH', '<Route>VERIFY</Route>', 'THINK: Find evidence.\nANSWER', 'ROUTES: FINISH'):
+            fixed = sft.convert_record(record(raw, candidate='<answer>Paris</answer>'))
+            action = sft.parse_action(fixed['messages'][-1]['content'], 'Router Agent', 'search', sft.ROLES['search'][:-1])
+            route = 'FINISH' if action.name == 'finish' else action.arguments['role']
+            self.assertEqual(route, fixed['route'])
+
+    def test_legacy_prompt_migrates_only_output_contract_and_new_calls_round_trip(self):
+        source = record('SEARCH')
+        source['input'] = source['input'].replace(sft.ROUTER_CALL_FORMAT,
+            '# Output Format\nOutput exactly one <route>ROLE_NAME</route>.\n')
+        original, _ = sft.decode_input(source['input'])
+        row = sft.convert_record(source)
+        before = original[1]['content'].split('# Output Format')[0]
+        self.assertTrue(row['messages'][1]['content'].startswith(before))
+        self.assertIn(sft.ROUTER_CALL_FORMAT, row['messages'][1]['content'])
+        self.assertNotIn('# Output Format', row['messages'][1]['content'])
+        for code in ('call_agent(role="SEARCH", task="Find a date")', 'finish()'):
+            row = sft.convert_record(record(code, candidate='Saved candidate'))
+            self.assertEqual(row['messages'][-1]['content'], code)
+            self.assertFalse(row['is_repaired'])
 
 
 if __name__ == '__main__':

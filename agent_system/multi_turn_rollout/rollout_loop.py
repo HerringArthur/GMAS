@@ -560,6 +560,20 @@ class MultiAgentTrajectoryCollector(TrajectoryCollector):
 
             # Submit the latest text actions after collaboration ends.
             next_obs, rewards, dones, infos = envs.step(text_actions)
+            if router_orchestra:
+                # Attach execution observations to the actual last decision only.
+                # These strings are metadata, never sampled response tokens.
+                observations = next_obs.get("anchor")
+                if observations is None:
+                    observations = next_obs.get("text") or [""] * batch_size
+                for entry in multiagent_batch_buffer:
+                    metadata = entry['batch'].non_tensor_batch
+                    for index in np.flatnonzero(metadata["return_reason"] != ""):
+                        metadata["environment_action"][index] = text_actions[index]
+                        metadata["environment_result"][index] = observations[index] or ""
+                        if metadata["return_reason"][index] == "search":
+                            status = infos[index].get("tool_status", "executed")
+                            metadata["execution_status"][index] = status
             ###############################
             if len(rewards.shape) == 2:
                 rewards = rewards.squeeze(1)

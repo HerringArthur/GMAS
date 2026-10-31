@@ -15,12 +15,11 @@
 
 from typing import Any, Dict, List, Tuple
 
-import numpy as np
 from transformers import PreTrainedTokenizer
 from verl import DataProto
 
 from agent_system.agent.agents.base import BaseAgent
-from agent_system.agent.utils import general_projection
+from agent_system.code_actions import action_instructions, project_code_actions
 from agent_system.multi_turn_rollout.utils import preprocess_batch
 
 
@@ -46,10 +45,10 @@ You are VERIFY. Your responsibility is to critically review the most recent
 mathematical solution provided by SOLVE or REVISE, using the current candidate
 answer. Check each reasoning step, formula, and conclusion for accuracy,
 completeness, and logical consistency.
-At the end of your output, you MUST provide your verdict within <verify> </verify>
-using exactly one of:
-(1) <verify>approve</verify> if all steps and the final answer are correct.
-(2) <verify>reject</verify> if you detect any issue.
+Call record_review(approved=False, feedback="Your assessment and evidence").
+Set approved=True only if all reasoning steps and the final answer are correct;
+otherwise use False. Explain specific errors or missing cases in feedback.
+Your review updates shared state; it does not replace the candidate or submit it.
 """
 
 
@@ -64,8 +63,7 @@ class VerifierAgent(BaseAgent):
             processor=processor,
             config=config,
         )
-        self.start_tag = "<verify>"
-        self.end_tag = "</verify>"
+        self.prompt += action_instructions("VERIFY", "math")
 
     def call(
         self,
@@ -88,14 +86,7 @@ class VerifierAgent(BaseAgent):
         )
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
 
-        text_responses, valids = general_projection(
-            text_responses,
-            start_tag=self.start_tag,
-            end_tag=self.end_tag,
-            check_think_tag=False,
-            return_whole_response=True,
+        return project_code_actions(
+            batch, text_responses, agent_active_mask,
+            role=self.name, scene="math", step=step,
         )
-        batch.non_tensor_batch["is_action_valid"] = valids & agent_active_mask
-        batch.non_tensor_batch["selected_role"] = np.full(len(text_responses), "", dtype=object)
-        batch.non_tensor_batch["env_step"] = np.full(len(text_responses), step, dtype=object)
-        return batch, text_responses

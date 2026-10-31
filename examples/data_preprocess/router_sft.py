@@ -1,8 +1,8 @@
-"""Build Router format SFT from real GMAS rollout logs, using explicit rules only.
+"""Build Router function-call SFT from real rollouts, retaining explicit choices.
 
-The input is preserved. The target retains the role explicitly emitted by the
-Router, with normalized tags and optional original reasoning. No model calls,
-reference answers, synthetic states, or policy relabelling are involved.
+Legacy logs keep their task, history and candidate; only the output instructions
+are migrated. Legacy routing explanations become the task argument. New code
+outputs are validated directly. No generated labels or reference answers.
 """
 
 from __future__ import annotations
@@ -12,8 +12,15 @@ import hashlib
 import json
 import re
 import statistics
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+
+# Support the existing cluster launchers that execute this file by path.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from agent_system.code_actions import ActionError, ROUTER_CALL_FORMAT, parse_action
 
 ROLES = {"search": ("SEARCH", "VERIFY", "ANSWER", "FINISH"),
          "math": ("SOLVE", "VERIFY", "REVISE", "FINISH")}
@@ -262,7 +269,24 @@ def convert_record(record, route_only=False, success_only=False):
         raise Rejected("episode_not_successful_or_unknown")
     messages, prefix = decode_input(record["input"])
     scene, question, candidate, roles = prompt_state(messages[1]["content"])
-    fixed = repair_response(prefix + record["original_output"], route_only)
+    raw = clean_response(prefix + record["original_output"])
+    try:
+        parsed = parse_action(raw, "Router Agent", scene, ROLES[scene][:-1])
+    except ActionError:
+        protocol_converted = True
+        fixed = repair_response(raw, route_only)
+        thought = re.search(r"<think>(.*?)</think>", fixed["response"], re.S)
+        task = thought[1] if thought and not route_only else ""
+        fixed["response"] = (
+            "finish()" if fixed["route"] == "FINISH" else
+            f'call_agent(role={fixed["route"]!r}, task={task!r})'
+        )
+    else:
+        protocol_converted = False
+        route = "FINISH" if parsed.name == "finish" else parsed.arguments["role"]
+        fixed = {"route": route, "response": raw, "repair_rule": "already_valid", "is_repaired": False}
+        if route_only and parsed.name == "call_agent":
+            fixed["response"] = f"call_agent(role={route!r})"
     route = fixed["route"]
     if route not in roles:
         raise Rejected("role_unavailable_in_prompt")
@@ -270,12 +294,19 @@ def convert_record(record, route_only=False, success_only=False):
         raise Rejected("finish_without_candidate")
     if scene == "math" and route in ("VERIFY", "REVISE") and not candidate:
         raise Rejected("math_review_without_candidate")
-    # No change to question/evidence/candidate/history; the existing role choice
-    # is the only label source. selected_role metadata is not a fallback label.
+    # Migrate only the Router's output contract, never its task or state.
+    prompt = messages[1]["content"]
+    if "\n# Output Format\n" in prompt:
+        before, contract = prompt.rsplit("\n# Output Format\n", 1)
+        _, options = contract.split("\n# Available Roles\n", 1)
+        messages[1]["content"] = before + "\n" + ROUTER_CALL_FORMAT + "\n# Available Roles\n" + options
+    elif "\n# Function Call Output\n" not in prompt:
+        raise Rejected("unsupported_output_contract")
     return {
         "messages": messages + [{"role": "assistant", "content": fixed["response"]}],
         "question_id": question_id(question), "scene": scene, "route": route,
         "repair_rule": fixed["repair_rule"], "is_repaired": fixed["is_repaired"],
+        "action_protocol": "python_call_v1", "protocol_converted": protocol_converted,
         "source_file": record["source_file"], "traj_uid": record.get("traj_uid"),
         "turn": record["turn"], "data_source": record.get("data_source", "unknown"),
         "episode_pass": record.get("episode_pass"), "original_valid": record.get("original_valid"),
@@ -413,6 +444,8 @@ def build(args):
     splits = split_rows(kept, args.val_fraction, args.seed)
     report = {
         "source": "real_rollout_format_repair", "label_policy": "preserve_explicit_role",
+        "action_protocol": "python_call_v1",
+        "protocol_converted_examples": sum(r["protocol_converted"] for r in kept),
         "success_only": args.success_only, "route_only": args.route_only,
         "max_per_question_route": args.max_per_question_route,
         "length_checked": tokenizer is not None, "max_length": args.max_length,
@@ -466,7 +499,7 @@ def main():
     p.add_argument("--logs", nargs="+", default=[])
     p.add_argument("--records", nargs="+", default=[], help="Records previously exported by extract-log")
     p.add_argument("--success-only", action="store_true", help="Require episode pass=1 (default includes failed episodes)")
-    p.add_argument("--route-only", action="store_true", help="Omit original reasoning; target only the route tag")
+    p.add_argument("--route-only", action="store_true", help="Omit original routing explanation from the function call")
     p.add_argument("--max-per-question-route", type=int, default=4, help="Cap repeated states per question/scene/role; 0 disables")
     p.add_argument("--tokenizer", help="SFT model/tokenizer for rejecting overlong examples")
     p.add_argument("--max-length", type=int, default=8192)

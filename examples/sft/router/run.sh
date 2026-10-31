@@ -21,6 +21,8 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 report = json.loads((root / "report.json").read_text())
+if report.get("action_protocol") != "python_call_v1":
+    raise SystemExit("Rebuild this dataset with the current router_sft converter: Router now uses Python function calls.")
 if not report["ready_for_training"]:
     raise SystemExit("Check report.json: need token length checks and nonempty train/val splits.")
 if report["splits"]["train"]["examples"] < int(sys.argv[2]):

@@ -13,15 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from typing import Any, Dict, List, Tuple
 
-import numpy as np
 from transformers import PreTrainedTokenizer
 from verl import DataProto
 
 from agent_system.agent.agents.base import BaseAgent
 from agent_system.agent.registry import AgentRegistry
+from agent_system.code_actions import project_code_actions
 from agent_system.multi_turn_rollout.utils import preprocess_batch
 
 
@@ -61,11 +60,13 @@ update the shared context without replacing that answer. Choose FINISH when the
 candidate answer is ready for submission. If no candidate answer exists or it
 needs correction, select a role to prepare it.
 
-# Output Format
-Output exactly one <route>ROLE_NAME</route> or <route>FINISH</route>.
-You may precede it with one brief <think>...</think> block explaining the choice
-and giving the selected role its next task. This text is shared with that role.
-Use an exact available role name and output nothing after </route>.
+# Function Call Output
+Output exactly one Python function call, using literal keyword arguments:
+- call_agent(role="ROLE_NAME", task="The selected role's next task")
+- finish()
+The task argument is optional. Use an exact available role name. finish() has
+no arguments and requires a saved candidate. Do not output XML tags, Markdown
+fences, assignments, imports, nested calls, or additional statements.
 """
 
 
@@ -111,21 +112,8 @@ class RouterAgent(BaseAgent):
         )
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
 
-        selected_roles = np.full(len(text_responses), "", dtype=object)
-        for i, (response, active) in enumerate(zip(text_responses, agent_active_mask)):
-            if not active:
-                continue
-            match = re.fullmatch(
-                r"\s*(?:<think>(?:(?!</?(?:think|route)>).)*</think>\s*)?<route>([^<>]+)</route>\s*",
-                response,
-                flags=re.DOTALL,
-            )
-            if match is not None:
-                role = match.group(1).strip()
-                if role in self.role_ids or role == "FINISH":
-                    selected_roles[i] = role
-
-        batch.non_tensor_batch["selected_role"] = selected_roles
-        batch.non_tensor_batch["is_action_valid"] = selected_roles != ""
-        batch.non_tensor_batch["env_step"] = np.full(len(text_responses), step, dtype=object)
-        return batch, text_responses
+        return project_code_actions(
+            batch, text_responses, agent_active_mask,
+            role=self.name, scene=self.config.env.env_name, step=step,
+            available_roles=self.role_ids,
+        )

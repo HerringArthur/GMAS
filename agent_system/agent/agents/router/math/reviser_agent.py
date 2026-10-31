@@ -15,13 +15,12 @@
 
 from typing import Any, Dict, List, Tuple
 
-import numpy as np
 from transformers import PreTrainedTokenizer
 from verl import DataProto
 
 from agent_system.agent.agents.base import BaseAgent
+from agent_system.code_actions import action_instructions, project_code_actions
 from agent_system.agent.registry import AgentRegistry
-from agent_system.agent.utils import math_projection
 from agent_system.multi_turn_rollout.utils import preprocess_batch
 
 
@@ -58,7 +57,9 @@ can be understood on its own. If no candidate is available, use the problem and
 shared work to construct a complete solution.
 
 Briefly explain what you changed and why, then provide the complete revised solution.
-You should give the final answer within \boxed{{}}.
+Call save_candidate(answer="final answer", solution="complete mathematical derivation").
+Include all necessary reasoning in solution. The answer argument contains the
+final mathematical expression; the environment adapter adds the boxed notation.
 """
 
 
@@ -74,6 +75,7 @@ class ReviserAgent(BaseAgent):
             processor=processor,
             config=config,
         )
+        self.prompt += action_instructions("REVISE", "math")
 
     def call(
         self,
@@ -96,8 +98,7 @@ class ReviserAgent(BaseAgent):
         )
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
 
-        text_responses, valids = math_projection(text_responses, check_think_tag=False)
-        batch.non_tensor_batch["is_action_valid"] = valids & agent_active_mask
-        batch.non_tensor_batch["selected_role"] = np.full(len(text_responses), "", dtype=object)
-        batch.non_tensor_batch["env_step"] = np.full(len(text_responses), step, dtype=object)
-        return batch, text_responses
+        return project_code_actions(
+            batch, text_responses, agent_active_mask,
+            role=self.name, scene="math", step=step,
+        )

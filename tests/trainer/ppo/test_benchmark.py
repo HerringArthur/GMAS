@@ -49,6 +49,12 @@ class Batch:
             "env_step": [1, 1, 2], "episode_rewards": [1.0, 0.0, 1.0],
             "agent_path": [("Worker",), (), ("Worker",)],
             "return_reason": ["search", "finish", "finish"],
+            "action_name": ["call_agent", "finish", "search"],
+            "action_args": [{"role": "SEARCH", "task": "查证"}, {}, {"query": "newborn"}],
+            "environment_action": ["", "<answer>B</answer>", "<search>newborn</search>"],
+            "execution_status": ["dispatched", "submitted", "success"],
+            "candidate_review": [None, None, {"candidate_version": 1, "env_step": 1,
+                                               "assessment": {"sufficient": False, "feedback": "Need evidence"}}],
         }
         self.batch = {
             "prompts": Array([[0, 11, 12], [0, 21, 22], [31, 32, 33]]),
@@ -94,6 +100,9 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(sample["turns"][0]["input"], "R:11,12")
             self.assertEqual(sample["turns"][0]["output"], "R:13,14")
             self.assertEqual(sample["turns"][1]["output"], "W:34")
+            self.assertEqual(sample["turns"][0]["action_args"], {"role": "SEARCH", "task": "查证"})
+            self.assertEqual(sample["turns"][1]["environment_action"], "<search>newborn</search>")
+            self.assertFalse(sample["turns"][1]["candidate_review"]["assessment"]["sufficient"])
             self.assertEqual(sample["episode_rewards"], 1.0)
             self.assertIn("[Input]", (Path(folder) / "rollout_samples/step_000001.txt").read_text())
 

@@ -94,7 +94,8 @@ else:
             ]} for source in sources]
             (self.root / f'{scene}.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in episodes))
         for relative in ('examples/sft/router/collect.sh', 'examples/sft/router/sbatch_collect.sh',
-                         'examples/sft/router/sbatch_build.sh', 'examples/data_preprocess/router_sft.py'):
+                         'examples/sft/router/sbatch_build.sh', 'examples/data_preprocess/router_sft.py',
+                         'agent_system/code_actions.py'):
             target = self.root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text((ROOT / relative).read_text())
@@ -300,7 +301,7 @@ print(str(10000 + number) + (';' + os.environ['SBATCH_CLUSTER'] if os.environ.ge
         self.assertEqual(report['accepted_episode_outcomes'], {'success': 20})
         for split in ('train', 'val'):
             for line in (output / f'{split}.jsonl').read_text().splitlines():
-                self.assertEqual(json.loads(line)['messages'][-1]['content'], '<route>SOLVE</route>')
+                self.assertEqual(json.loads(line)['messages'][-1]['content'], "call_agent(role='SOLVE', task='')")
 
     def test_empty_dataset_keeps_diagnostics_and_fails_job(self):
         self.env['SFT_MAX_LENGTH'] = '1'
