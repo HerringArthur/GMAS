@@ -185,9 +185,11 @@ def rollout(groups, valid=None):
 
 
 class ValidActionTrainingTests(unittest.TestCase):
-    def run_fit(self, batches, async_reward=False, balance=True, use_penalty=True):
+    def run_fit(self, batches, async_reward=False, balance=True, use_penalty=True,
+                save_freq=1, expected_checkpoint_steps=None):
         ns = load_driver()
         self.calls, self.logs, self.adjustments = [], [], []
+        self.checkpoint_steps = []
         groups = ['router', 'worker', 'unused']
 
         def inspect_batch(stage, batch, wg=None):
@@ -270,7 +272,7 @@ class ValidActionTrainingTests(unittest.TestCase):
         config = Config(
             trainer=Config(project_name='test', experiment_name='filter', logger=[], total_epochs=1,
                            val_before_train=False, balance_batch=balance, n_gpus_per_node=1, nnodes=1,
-                           critic_warmup=0, test_freq=1, save_freq=1, rollout_data_dir='fake-dump',
+                           critic_warmup=0, test_freq=1, save_freq=save_freq, rollout_data_dir='fake-dump',
                            benchmark=Config(output_dir='fake-benchmark')),
             actor_rollout_ref=actor_config, critic=Config(ulysses_sequence_parallel_size=1),
             reward_model=Config(launch_reward_fn_async=async_reward), env=Config(rollout=Config(n=1)),
@@ -308,7 +310,9 @@ class ValidActionTrainingTests(unittest.TestCase):
         )
         self.trainer = SimpleNamespace(
             config=config, total_training_steps=len(batches), train_dataloader=[batches[0]] * len(batches),
-            _load_checkpoint=lambda: None, _save_checkpoint=Mock(), _validate=Mock(return_value={'val/test': 1}),
+            _load_checkpoint=lambda: None,
+            _save_checkpoint=Mock(side_effect=lambda: self.checkpoint_steps.append(self.trainer.global_steps)),
+            _validate=Mock(return_value={'val/test': 1}),
             val_reward_fn=object(), reward_fn=None, envs=None, tokenizers={
                 wg: SimpleNamespace(batch_decode=lambda rows, **kw: rows[:, 0].tolist()) for wg in groups
             },
@@ -327,8 +331,21 @@ class ValidActionTrainingTests(unittest.TestCase):
             ns['fit'](self.trainer)
         self.assertEqual(progress.update.call_count, len(batches))
         self.assertEqual(self.trainer._validate.call_count, len(batches))
-        self.assertEqual(self.trainer._save_checkpoint.call_count, len(batches))
+        if expected_checkpoint_steps is None:
+            expected_checkpoint_steps = list(range(1, len(batches) + 1))
+        self.assertEqual(self.checkpoint_steps, expected_checkpoint_steps)
         self.assertEqual(self.benchmark.record_step.call_count, len(batches))
+
+    def test_checkpoint_schedule_supports_final_only_periodic_and_disabled_saving(self):
+        for save_freq, steps, expected in (
+            (0, 1, [1]), (0, 2, [2]), (0, 45, [45]),
+            (20, 45, [20, 40, 45]), (20, 40, [20, 40]), (-1, 3, []),
+        ):
+            with self.subTest(save_freq=save_freq, steps=steps):
+                self.run_fit(
+                    [rollout(['router', 'worker'], [True, True]) for _ in range(steps)],
+                    save_freq=save_freq, expected_checkpoint_steps=expected,
+                )
 
     def test_keeps_invalid_rows_through_padding_and_updates_with_penalized_rewards(self):
         for asynchronous in [False, True]:

@@ -283,7 +283,7 @@ trainer:
     seed: 42
   nnodes: 1
   n_gpus_per_node: 8
-  save_freq: -1
+  save_freq: -1 # <0: disabled; 0: final step only; >0: every N steps and the final step
   # auto: find the last ckpt to resume. If can't find, start from scratch
   resume_mode: auto # or disable or resume_path if resume_from_path is set
   resume_from_path: null
