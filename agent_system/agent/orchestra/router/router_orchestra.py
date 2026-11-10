@@ -35,7 +35,8 @@ Agent contract:
   validity, allowing a complete query without think tags to execute.
   Math SOLVE/REVISE use math_projection;
   math VERIFY checks verify tags with general_projection. All math roles
-  preserve complete responses. Search VERIFY checks for nonempty responses.
+  preserve complete responses. Search VERIFY requires one terminal yes/no verdict
+  and preserves the complete report.
   Role agents supply an empty ``selected_role`` field.
   This module does not parse model-generated tags.
   Orchestra attaches ``parent_prefix_key`` to each batch for Router credit.

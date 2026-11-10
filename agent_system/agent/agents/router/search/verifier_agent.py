@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -28,36 +29,35 @@ VERIFIER_PROMPT = r"""
 {env_prompt}
 
 # Current Candidate Answer
-The latest saved candidate is provided below for evaluation and improvement.
-Being saved does not imply that it is correct or has been verified.
+Treat this candidate as unverified.
 {candidate_answer}
 
 # Your Teammates' Outputs at Step {step}
 {team_context}
 
-# Your Assignment
-Use the original task, current candidate answer, shared work, and the latest
-Router assignment to perform your role. Return your work so the Router can
-choose the next step.
-
 # Your Role
-You are VERIFY. Your job is to analyze the team's past search queries and reflect
-on their quality, efficiency, and alignment with the task goal. Then you need to
-determine whether the current historical information is sufficient to answer the
-question. Report your assessment to the Router Agent.
+You are VERIFY. Assess whether the retrieved evidence supports answering the
+original question. Use the Router assignment to focus your review.
+Point to supporting facts or documents actually present in the search history,
+or identify specific missing or conflicting evidence. Queries, candidate answers,
+and teammates' claims are not retrieved evidence. Do not invent sources or results.
+Without a candidate, judge whether the evidence is sufficient to form an answer.
+With a candidate, also check whether the evidence supports that answer.
 
-Your responsibilities:
-- Review past search queries enclosed within <search> </search> and external information enclosed within <information> </information>.
-- Evaluate whether previous queries were reasonable and aligned with the task objective.
-- Identify potential issues (if any), including repeated or redundant queries; imprecise queries that are too broad, vague, or missing critical constraints/entities; misaligned queries that drift away from the actual task goal.
-- Assess whether the available information is complete and sufficient to generate a high-quality answer.
-- If a candidate answer is available, check whether it is supported by the retrieved evidence.
-
-You are now at step {step}. You should first reason step-by-step about the past
-events. After completing your reasoning, give your assessment:
-(1) If the information is sufficient to answer the question: return <verify>yes</verify>
-(2) If the information is insufficient to answer the question: return <verify>no</verify>
+# Output Format
+Give a brief assessment, then end with exactly one verdict:
+<verify>yes</verify>: The evidence is sufficient and supports the candidate, if present.
+<verify>no</verify>: The evidence is missing, insufficient, conflicting, or contradicts the candidate.
+Use the verdict tag only once, at the end. Output nothing after </verify>.
 """
+
+
+def _has_final_verdict(response: str) -> bool:
+    """Require one terminal yes/no verdict, preserving the complete report."""
+    verdict = re.search(r"<verify>\s*(?:yes|no)\s*</verify>\s*\Z", response)
+    return verdict is not None and re.search(
+        r"</?verify\b", response[:verdict.start()], flags=re.IGNORECASE,
+    ) is None
 
 
 class VerifierAgent(BaseAgent):
@@ -94,7 +94,7 @@ class VerifierAgent(BaseAgent):
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
 
         batch.non_tensor_batch["is_action_valid"] = np.array(
-            [active and bool(response.strip()) for response, active in zip(text_responses, agent_active_mask)],
+            [active and _has_final_verdict(response) for response, active in zip(text_responses, agent_active_mask)],
             dtype=bool,
         )
         batch.non_tensor_batch["selected_role"] = np.full(len(text_responses), "", dtype=object)

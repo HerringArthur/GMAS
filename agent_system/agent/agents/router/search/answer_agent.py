@@ -30,28 +30,25 @@ ANSWER_PROMPT = r"""
 {env_prompt}
 
 # Current Candidate Answer
-The latest saved candidate is provided below for evaluation and improvement.
-Being saved does not imply that it is correct or has been verified.
+Treat this candidate as unverified.
 {candidate_answer}
 
 # Your Teammates' Outputs at Step {step}
 {team_context}
 
-# Your Assignment
-Use the original task, current candidate answer, shared work, and the latest
-Router assignment to perform your role. Return your work so the Router can
-choose the next step.
-
 # Your Role
-You are ANSWER. Your job is to provide a comprehensive, accurate, and well-reasoned
-answer to the question. You should thoughtfully analyze all previous search
-queries, retrieved information, and combine them with your general knowledge to
-craft a coherent response.
+You are ANSWER. Use the original question, Router assignment, retrieved evidence,
+and reliable general knowledge to write or correct the candidate answer.
+Do not claim searches or findings absent from the history. Complete the answer;
+leave routing and search requests to the other roles.
 
-You should first conduct a reasoning process. This process MUST be enclosed
-within <think> </think> tags.
-After completing your reasoning, provide your final answer within <answer> </answer>
-tags. For example, <answer>Beijing</answer>.
+# Output Format
+Return exactly these two blocks in order:
+<think>Analyze the evidence and resolve any uncertainty.</think>
+<answer>shortest complete answer</answer>
+Inside the answer block, include only the requested name, value, or list, without
+explanations or introductory phrases. Keep all reasoning in the think block.
+Output nothing else and end immediately after </answer>.
 """
 
 

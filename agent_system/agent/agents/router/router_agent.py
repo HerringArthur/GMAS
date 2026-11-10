@@ -27,14 +27,14 @@ from agent_system.multi_turn_rollout.utils import preprocess_batch
 
 ROLE_DESCRIPTIONS = {
     "math": {
-        "SOLVE": "Analyze the problem, develop a solution, and provide an answer.",
-        "VERIFY": "Check the mathematical derivation and answer; identify errors or confirm correctness.",
-        "REVISE": "Use the existing solution and review feedback to identify errors, correct the derivation, and provide a complete revised solution.",
+        "SOLVE": "Solve the problem and provide an answer.",
+        "VERIFY": "Check the mathematical derivation and answer.",
+        "REVISE": "Use review feedback to correct the solution and provide a complete revised solution.",
     },
     "search": {
-        "SEARCH": "Formulate a targeted search request. Valid requests are executed by the environment before your next decision; no FINISH is needed.",
-        "VERIFY": "Review past search queries and assess whether the retrieved evidence is sufficient to answer the question.",
-        "ANSWER": "Use the available evidence to compose a complete answer to the question.",
+        "SEARCH": "Write a search query. The environment executes it automatically before your next decision.",
+        "VERIFY": "Check whether the retrieved evidence is sufficient and supports the candidate answer.",
+        "ANSWER": "Use the available evidence to write or correct an answer.",
     },
 }
 
@@ -44,7 +44,6 @@ ROUTER_PROMPT = """
 {env_prompt}
 
 # Current Candidate Answer
-The latest saved candidate is provided below for evaluation and improvement.
 Being saved does not imply that it is correct or has been verified.
 {candidate_answer}
 
@@ -52,20 +51,11 @@ Being saved does not imply that it is correct or has been verified.
 {team_context}
 
 # Your Role
-You are the Router Agent. Read the task, current candidate answer, and shared
-work, then select the role needed next from the available roles below. Choose
-the order according to the current progress. You may select the same role again.
-
-FINISH submits the latest saved candidate answer to the environment. Reviews
-update the shared context without replacing that answer. Choose FINISH when the
-candidate answer is ready for submission. If no candidate answer exists or it
-needs correction, select a role to prepare it.
-
-# Output Format
-Output exactly one <route>ROLE_NAME</route> or <route>FINISH</route>.
-You may precede it with one brief <think>...</think> block explaining the choice
-and giving the selected role its next task. This text is shared with that role.
-Use an exact available role name and output nothing after </route>.
+You are the Router Agent. Choose the next role using the task, candidate answer,
+and team outputs. You may select a role again.
+VERIFY adds feedback without replacing the candidate answer.
+Use FINISH only when a candidate exists and is ready to submit. Otherwise,
+choose a role to prepare or correct it.
 """
 
 
@@ -91,14 +81,20 @@ class RouterAgent(BaseAgent):
         available_roles = [role for role in self.role_ids if not (last_search_step and role == "SEARCH")]
         role_descriptions = ROLE_DESCRIPTIONS[self.config.env.env_name]
         role_prompt = "\n# Available Roles\n" + "\n".join(
-            f"- {role}: {role_descriptions[role]}" for role in available_roles
-        ) + "\n- FINISH: Submit the latest saved candidate answer to the environment.\n"
+            f"<route>{role}</route>: {role_descriptions[role]}" for role in available_roles
+        ) + "\n<route>FINISH</route>: Submit the saved candidate answer.\n"
         if last_search_step:
             role_prompt += (
                 "\nThis is the final environment step. SEARCH is unavailable. "
-                "Use the available evidence to prepare or check an answer, "
-                "then select FINISH to submit the saved candidate.\n"
+                "Prepare or check an answer, then submit it with FINISH.\n"
             )
+        role_prompt += (
+            "\n# Output Format\n"
+            "Return exactly one of the route blocks listed above, including its tags.\n"
+            "You may precede it with one brief <think>...</think> block explaining your choice\n"
+            "and giving the selected role a task. This text is shared with that role.\n"
+            "Output nothing else and end immediately after </route>.\n"
+        )
         obs = self.build_prompt(env_obs, team_context, step, candidate_answers=candidate_answers)
         obs["text"] = [prompt + role_prompt for prompt in obs["text"]]
         batch = preprocess_batch(
