@@ -1368,6 +1368,21 @@ class RayPPOTrainer:
                                 loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                                 entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                                 old_log_prob_metrics = {f"actor/{wg_id}/entropy_loss": entropy_loss.detach().item()}
+                                # Role diagnostics remain separate when several roles share a model.
+                                role_ids = sub_batch.non_tensor_batch["agent_id"]
+                                role_masks = response_masks.to(entropys.device)
+                                if self.config.actor_rollout_ref.rollout.multi_turn.enable:
+                                    role_masks = role_masks * sub_batch.batch["loss_mask"].to(entropys.device)[:, -role_masks.shape[-1]:]
+                                for role_id in dict.fromkeys(role_ids):
+                                    indices = torch.as_tensor(
+                                        np.flatnonzero(role_ids == role_id), device=entropys.device,
+                                    )
+                                    role_entropy = entropys.index_select(0, indices)
+                                    role_mask = role_masks.index_select(0, indices)
+                                    if role_mask.sum().item() > 0:
+                                        old_log_prob_metrics[f"role/{normalize_agent_id(role_id)}/entropy_token_mean"] = (
+                                            agg_loss(role_entropy, role_mask, "token-mean").detach().item()
+                                        )
                                 metrics.update(old_log_prob_metrics)
                                 old_log_prob.batch.pop("entropys")
                                 sub_batch = sub_batch.union(old_log_prob)
@@ -1471,9 +1486,19 @@ class RayPPOTrainer:
                                     sub_batch = multiagent_batch[wg_id]
                                     assert all(wg_id == wg for wg in sub_batch.non_tensor_batch["wg_id"])
                                     sub_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                    if self.config.agent.orchestra_type == "router" and self.config.env.env_name == "search":
+                                        # A tensor keeps role labels aligned through microbatch reordering.
+                                        sub_batch.meta_info["metric_role_names"] = list(self.agent_ids)
+                                        role_indices = {name: idx for idx, name in enumerate(self.agent_ids)}
+                                        sub_batch.batch["metric_role_index"] = torch.tensor(
+                                            [role_indices[name] for name in sub_batch.non_tensor_batch["agent_id"]],
+                                            dtype=torch.long, device=sub_batch.batch["responses"].device,
+                                        )
                                     actor_output = self.actor_rollout_wg[wg_id].update_actor(sub_batch)
                                     actor_output_metrics = reduce_metrics(actor_output.meta_info[f"{wg_id}/metrics"])
                                     metrics.update(actor_output_metrics)
+                                    sub_batch.batch.pop("metric_role_index", None)
+                                    sub_batch.meta_info.pop("metric_role_names", None)
                                     multiagent_batch[wg_id] = sub_batch
 
                             batch: DataProto = combine_batches(multiagent_batch)

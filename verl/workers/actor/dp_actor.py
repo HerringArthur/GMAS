@@ -364,6 +364,8 @@ class DataParallelPPOActor(BasePPOActor):
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
+            if entropys is not None:
+                entropys = entropys[revert_indices]
 
         return log_probs, entropys
 
@@ -378,6 +380,14 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        metric_role_names = data.meta_info.get("metric_role_names", [])
+        role_loss_totals = None
+        if metric_role_names:
+            select_keys.append("metric_role_index")
+            role_loss_totals = torch.zeros(
+                (len(metric_role_names), 2), dtype=torch.float64,
+                device=get_torch_device().current_device(),
+            )
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -472,6 +482,31 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                     )
 
+                    if role_loss_totals is not None:
+                        # Diagnostics only: retain the original objective and gradient scaling.
+                        # Accumulate sums/counts so uneven role frequencies across ranks
+                        # and microbatches do not become equally weighted means.
+                        with torch.no_grad():
+                            for role_idx in range(len(metric_role_names)):
+                                rows = data["metric_role_index"] == role_idx
+                                role_mask = response_mask[rows]
+                                token_count = role_mask.sum()
+                                if token_count.item() == 0:
+                                    continue
+                                role_pg_loss, _, _, _ = compute_policy_loss(
+                                    old_log_prob=old_log_prob[rows],
+                                    log_prob=log_prob.detach()[rows],
+                                    advantages=advantages[rows],
+                                    response_mask=role_mask,
+                                    cliprange=clip_ratio,
+                                    cliprange_low=clip_ratio_low,
+                                    cliprange_high=clip_ratio_high,
+                                    clip_ratio_c=clip_ratio_c,
+                                    loss_agg_mode="token-mean",
+                                )
+                                role_loss_totals[role_idx, 0] += role_pg_loss.double() * token_count
+                                role_loss_totals[role_idx, 1] += token_count
+
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
@@ -506,4 +541,11 @@ class DataParallelPPOActor(BasePPOActor):
                 data = {f"actor/{wg_id}/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+        if role_loss_totals is not None:
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(role_loss_totals, op=torch.distributed.ReduceOp.SUM)
+            for role_name, (loss_sum, token_count) in zip(metric_role_names, role_loss_totals):
+                if token_count.item() > 0:
+                    prefix = f"role/{str(role_name).replace(' ', '')}"
+                    metrics[f"{prefix}/pg_loss_token_mean"] = [(loss_sum / token_count).item()]
         return metrics

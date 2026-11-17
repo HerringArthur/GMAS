@@ -93,6 +93,7 @@ def _set_specific_parameter(base_config, idx: int, total: int, agent_specific_pa
     )
 
 def build_wg_ids(config):
+    """Group models, keeping the GMAS search Router independent when sharing."""
     agent_ids = config.agent.agent_ids
     model_ids = config.agent.model_ids
     model_sharing = config.agent.model_sharing
@@ -119,23 +120,56 @@ def build_wg_ids(config):
             wg_to_agents[wg_id] = [{"agent_id": agent_id, "model_id": model_id, "config_actor_rollout_ref": per_config}]
             agent_port += 1
     else:
+        separate_router = (
+            OmegaConf.select(config, "agent.orchestra_type") == "router"
+            and OmegaConf.select(config, "env.env_name") == "search"
+        )
+        if separate_router:
+            expected_agents = {"Router Agent", "SEARCH", "VERIFY", "ANSWER"}
+            if len(agent_ids) != 4 or set(agent_ids) != expected_agents:
+                raise ValueError(
+                    "GMAS search model_sharing=True requires exactly Router Agent, SEARCH, VERIFY and ANSWER."
+                )
+            role_models = {
+                agent_id: model_id for agent_id, model_id in zip(agent_ids, model_ids)
+                if agent_id != "Router Agent"
+            }
+            if len(set(role_models.values())) != 1:
+                raise ValueError(
+                    "GMAS search model_sharing=True requires SEARCH, VERIFY and ANSWER "
+                    f"to use the same model_id; got {role_models}. Router may use a different model."
+                )
+        wg_to_agents = {}
+        agent_port = 0
         model_to_agents = defaultdict(list)
         for idx in range(total_agent_num):
             agent_id = agent_ids[idx]
             model_id = model_ids[idx]
             per_config = _set_specific_parameter(base_config, idx, total_agent_num, agent_specific_parameters)
+            if separate_router and agent_id == "Router Agent":
+                # Keep the original agent index for per-agent overrides. The
+                # remaining roles use the existing model-sharing path below.
+                per_config.rollout["agent_port"] = agent_port
+                wg_id = f"{normalize_model_id(model_id)}_{normalize_agent_id(agent_id)}"
+                wg_to_agents[wg_id] = [{
+                    "agent_id": agent_id,
+                    "model_id": model_id,
+                    "config_actor_rollout_ref": per_config,
+                }]
+                agent_port += 1
+                continue
             model_to_agents[model_id].append({"agent_id": agent_id, "config_actor_rollout_ref": per_config})
 
-        wg_to_agents = {}
-        agent_port = 0
         for model_id, agents_configs in model_to_agents.items():
             for ac in agents_configs:
                 ac["config_actor_rollout_ref"].rollout["agent_port"] = agent_port
             ref_cfg = agents_configs[0]["config_actor_rollout_ref"]
             for ac in agents_configs[1:]:
-                assert omega_equal_resolved(ref_cfg, ac["config_actor_rollout_ref"]), (
-                    f"Agents sharing model '{model_id}' must have equal configs."
-                )
+                if not omega_equal_resolved(ref_cfg, ac["config_actor_rollout_ref"]):
+                    raise ValueError(
+                        f"Agents sharing model '{model_id}' must have equal configs: "
+                        f"{agents_configs[0]['agent_id']} and {ac['agent_id']} differ."
+                    )
 
             norm_agents = [normalize_agent_id(ac["agent_id"]) for ac in agents_configs]
             norm_model = normalize_model_id(model_id)

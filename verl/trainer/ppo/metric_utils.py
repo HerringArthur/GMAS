@@ -76,6 +76,40 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     )
 
 
+def compute_role_data_metrics(batch: DataProto) -> Dict[str, Any]:
+    """Describe each role's training rows, including worker-divisibility copies."""
+    agent_ids = batch.non_tensor_batch.get("agent_id")
+    if agent_ids is None:
+        return {}
+    metrics = {}
+    for agent_id in dict.fromkeys(agent_ids):
+        role_batch = batch.select_idxs(np.flatnonzero(agent_ids == agent_id))
+        prefix = f"role/{str(agent_id).replace(' ', '')}"
+        response_length = role_batch.batch["responses"].shape[-1]
+        mask = role_batch.batch.get("response_mask")
+        if mask is None:
+            mask = role_batch.batch["attention_mask"][:, -response_length:]
+        if "loss_mask" in role_batch.batch:
+            mask = mask * role_batch.batch["loss_mask"][:, -response_length:]
+        mask = mask.bool()
+        metrics[f"{prefix}/training_rows"] = len(role_batch)
+        metrics[f"{prefix}/effective_tokens"] = mask.sum().item()
+        metrics[f"{prefix}/response_length/mean"] = mask.sum(-1).float().mean().item()
+        if "is_action_valid" in role_batch.non_tensor_batch:
+            metrics[f"{prefix}/valid_action_ratio"] = float(role_batch.non_tensor_batch["is_action_valid"].mean())
+        for name, values in (
+            ("score", role_batch.batch["token_level_scores"].sum(-1)),
+            ("rewards", role_batch.batch["token_level_rewards"].sum(-1)),
+            ("advantages", role_batch.batch["advantages"].masked_select(mask)),
+        ):
+            if values.numel():
+                values = values.detach().float()
+                metrics[f"{prefix}/{name}/mean"] = values.mean().item()
+                metrics[f"{prefix}/{name}/min"] = values.min().item()
+                metrics[f"{prefix}/{name}/max"] = values.max().item()
+    return metrics
+
+
 def compute_data_metrics(batch: DataProto, unique_wg_ids: List[str], group_n: int, use_critic: bool = True) -> Dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -107,8 +141,8 @@ def compute_data_metrics(batch: DataProto, unique_wg_ids: List[str], group_n: in
     # Split batch by wg_ids
     multiagent_batch = split_batch_by_wg_ids(batch, unique_wg_ids)
     
-    metrics = {}
-    
+    metrics = compute_role_data_metrics(batch)
+
     # Compute critic metrics for each wg_id
     for wg_id, sub_batch in multiagent_batch.items():
         sequence_score = sub_batch.batch["token_level_scores"].sum(-1)
