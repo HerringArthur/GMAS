@@ -91,8 +91,6 @@ class RouterAgent(BaseAgent):
         role_prompt += (
             "\n# Output Format\n"
             "Return exactly one of the route blocks listed above, including its tags.\n"
-            "You may precede it with one brief <think>...</think> block explaining your choice\n"
-            "and giving the selected role a task. This text is shared with that role.\n"
             "Output nothing else and end immediately after </route>.\n"
         )
         obs = self.build_prompt(env_obs, team_context, step, candidate_answers=candidate_answers)

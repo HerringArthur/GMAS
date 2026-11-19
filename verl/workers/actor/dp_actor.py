@@ -104,12 +104,42 @@ class DataParallelPPOActor(BasePPOActor):
             if "logits_to_keep" not in inspect.signature(model.forward).parameters:
                 raise ValueError("response_only_logits requires a model with logits_to_keep support")
 
+        self.use_torch_compile = self.config.get("use_torch_compile", True)  # use torch compile by default
+        print(f"Actor use_torch_compile={self.use_torch_compile}")
         self.compute_entropy_from_logits = (
             torch.compile(verl_F.entropy_from_logits, dynamic=True)
-            if self.config.get("use_torch_compile", True)  #  use torch compile by default
+            if self.use_torch_compile
             else verl_F.entropy_from_logits
         )
+        if self.use_torch_compile:
+            self._warmup_compiled_entropy(actor_module)
         self.device_name = get_device_name()
+
+    def _warmup_compiled_entropy(self, actor_module):
+        """Prime the compiled entropy graph at init instead of during the first update.
+
+        The first call of a torch.compile'd function performs dynamo tracing,
+        inductor/triton codegen, first-call autotuning (do_bench) and the first
+        CUDA module loads. Doing that during the first training step, where the
+        forward and backward graphs are first called concurrently from two
+        threads while the rollout engines are active on the same GPU, can
+        deadlock/livelock under lazy CUDA module loading (torch 2.6 defaults
+        CUDA_MODULE_LOADING=LAZY) and hangs the whole update forever with no
+        error and no NCCL timeout. Warming up at init moves all of that work
+        into a quiet, serial phase, so later calls are pure cache hits.
+        """
+        try:
+            config = getattr(actor_module, "config", None)
+            vocab_size = getattr(config, "vocab_size", None) if config is not None else None
+            device = next(actor_module.parameters()).device
+            if not vocab_size or device.type != "cuda":
+                return
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                dummy = torch.zeros(2, vocab_size, device=device, dtype=torch.bfloat16, requires_grad=True)
+                self.compute_entropy_from_logits(dummy).sum().backward()
+            print(f"Actor compiled entropy warm-up done (vocab={vocab_size})")
+        except Exception as e:
+            print(f"Actor compiled entropy warm-up skipped ({e}); first-step compilation will run during training")
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
