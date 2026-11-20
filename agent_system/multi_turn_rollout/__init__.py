@@ -19,5 +19,4 @@ from .utils import (
     split_batch_by_wg_ids,
     combine_batches,
     get_valid_action_mask,
-    filter_valid_action_rows,
 )
