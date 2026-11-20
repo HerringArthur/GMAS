@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: bash examples/drmas_trainer/run_search.sh [train|eval|evaluation] [Hydra overrides...]
-source /data/workspace/xuhaobin/miniconda3/etc/profile.d/conda.sh
+source ${CONDA_BASE:-$HOME/miniconda3}/etc/profile.d/conda.sh
 conda activate DrMAS
 
 
@@ -9,7 +9,7 @@ set -x
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 source examples/trainer_logging.sh
 
-data_dir=/data/workspace/xuhaobin/xzy/data/MASsearch/drmas_search
+data_dir=${SEARCH_DATA_DIR:-$HOME/data/drmas_search}
 
 MODE=${1:-train}
 if [ "$#" -gt 0 ]; then
@@ -47,7 +47,7 @@ group_by_agent_id=True # enable Dr. MAS
 
 ##################### Agent Configurations #####################
 agent_ids='["Verifier Agent","Search Agent","Answer Agent"]'
-model_path=/data/workspace/xuhaobin/xzy/models/Qwen2.5-3B-Instruct
+model_path=${BASE_MODEL_PATH:-$HOME/models/Qwen2.5-3B-Instruct}
 model_ids="[\"$model_path\",\"$model_path\",\"$model_path\"]"
 model_sharing=False
 

@@ -4,12 +4,12 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
-save_path=/data/workspace/xuhaobin/xzy/data/MASsearch/search_data
+save_path=${SEARCH_DATA_DIR:-$HOME/data/searchR1}
 
 index_file=$save_path/e5_Flat.index
 corpus_file=$save_path/wiki-18.jsonl
 retriever_name=e5
-retriever_path=/data/workspace/xuhaobin/xzy/data/MASsearch/e5-base-v2-real
+retriever_path=${RETRIEVER_MODEL_DIR:-$HOME/models/e5-base-v2-real}
 
 CUDA_VISIBLE_DEVICES=1 python -u examples/search/retriever/retrieval_server.py \
   --index_path "$index_file" \

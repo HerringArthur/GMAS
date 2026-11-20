@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-source /data/workspace/xuhaobin/miniconda3/etc/profile.d/conda.sh
+source ${CONDA_BASE:-$HOME/miniconda3}/etc/profile.d/conda.sh
 conda activate DrMAS
 
 set -x

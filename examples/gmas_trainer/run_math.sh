@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: bash examples/gmas_trainer/run_math.sh [train|eval|evaluation] [Hydra overrides...]
-source /data/workspace/xuhaobin/miniconda3/etc/profile.d/conda.sh
+source ${CONDA_BASE:-$HOME/miniconda3}/etc/profile.d/conda.sh
 conda activate DrMAS
 
 set -euo pipefail

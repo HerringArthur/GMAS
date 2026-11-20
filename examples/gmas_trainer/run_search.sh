@@ -2,6 +2,7 @@
 # Usage: bash examples/gmas_trainer/run_search.sh [train|eval|evaluation] [Hydra overrides...]
 # Activate the Miniforge-based training environment in the sbatch job first.
 # WORK_DIR, DATA_DIR and MODEL_DIR can override the local project paths.
+# Use agent.model_sharing=True for an independent Router and shared SEARCH/VERIFY/ANSWER.
 
 set -euo pipefail
 set -x
@@ -68,7 +69,8 @@ actor_ppo_micro_batch_size_per_gpu='[4,4,4,4]'
 
 model_name_tag=$(python -c 'import json, sys; print("_".join(model.rsplit("/", 1)[-1].lower().replace("-", "_") for model in json.loads(sys.argv[1])))' "$model_ids")
 
-experiment_name="gmas_share${model_sharing}_${model_name_tag}"
+# Hydra resolves the sharing flag after applying trailing command-line overrides.
+experiment_name='gmas_share${agent.model_sharing}_'"${model_name_tag}"
 
 # Speed-first starting point: retain optimizer states on GPU. Compare CPU weight
 # caching with a Hydra override if repeated FSDP gathers dominate rollout time.

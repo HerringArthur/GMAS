@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compare the initial model on the same 210 search questions, one attempt each.
 # Usage: CUDA_VISIBLE_DEVICES=2,3,4,5 bash examples/eval_search_base.sh [both|drmas|gmas] [Hydra overrides...]
-source /data/workspace/xuhaobin/miniconda3/etc/profile.d/conda.sh
+source ${CONDA_BASE:-$HOME/miniconda3}/etc/profile.d/conda.sh
 conda activate DrMAS
 set -euo pipefail
 
@@ -18,8 +18,8 @@ esac
 
 : "${CUDA_VISIBLE_DEVICES:?Set CUDA_VISIBLE_DEVICES to the GPUs selected for evaluation}"
 IFS=',' read -r -a eval_gpus <<< "$CUDA_VISIBLE_DEVICES"
-model_path=${BASE_MODEL_PATH:-/data/workspace/xuhaobin/xzy/models/Qwen2.5-3B-Instruct}
-data_dir=${SEARCH_DATA_DIR:-/data/workspace/xuhaobin/xzy/data/MASsearch/drmas_search}
+model_path=${BASE_MODEL_PATH:-$HOME/models/Qwen2.5-3B-Instruct}
+data_dir=${SEARCH_DATA_DIR:-$HOME/data/drmas_search}
 
 # Fail before loading model workers if the retriever is unavailable.
 config_only=False
