@@ -1,0 +1,50 @@
+# Conda environment for the local e5 retrieval server used by Search training.
+# Mirrors the "Build Retriever environments" section of README.md.
+#
+# Create with:
+#   conda env create -f environment_retriever.yaml
+#   conda activate retriever
+#
+# torch (cu124) must be installed separately from PyTorch's CUDA 12.4 wheel
+# index, which a conda env spec cannot express per-package (see note below).
+
+name: retriever
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26.4
+  - faiss-gpu=1.8.0
+  - pip:
+      - transformers
+      - datasets
+      - pyserini
+      - huggingface_hub
+      - uvicorn
+      - fastapi
+
+# ---------------------------------------------------------------------------
+# torch must come from PyTorch's CUDA 12.4 wheel index. Run after
+# `conda env create -f environment_retriever.yaml`:
+#
+#   conda activate retriever
+#   pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+#       --index-url https://download.pytorch.org/whl/cu124
+#
+# NOTE: README installs torch (pip cu124) BEFORE faiss-gpu (conda), because
+# `conda install faiss-gpu -c pytorch -c nvidia` may pull its own conda-built
+# pytorch. If the yaml's conda step brings in a conflicting conda torch, fall
+# back to the README's manual order:
+#   conda create -n retriever python=3.10 -y && conda activate retriever
+#   conda install numpy==1.26.4
+#   pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+#       --index-url https://download.pytorch.org/whl/cu124
+#   pip install transformers datasets pyserini huggingface_hub
+#   conda install faiss-gpu==1.8.0 -c pytorch -c nvidia -y
+#   pip install uvicorn fastapi
+# ---------------------------------------------------------------------------

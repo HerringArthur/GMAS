@@ -1,0 +1,59 @@
+# Conda environment for the DrMAS experiment environment.
+# Mirrors the "Install veRL" + "1. Search" sections of README.md.
+#
+# Create with:
+#   conda env create -f environment.yaml
+#   conda activate DrMAS
+#
+# A few steps from the README cannot be expressed in a conda env spec and
+# must be run after `conda env create` (see the note at the bottom).
+
+name: DrMAS
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      # == requirements_sglang.txt (source of truth for these pins) ==
+      - accelerate
+      - codetiming
+      - datasets
+      - dill
+      - hydra-core
+      - numpy
+      - pandas
+      - peft<=0.17.1
+      - pyarrow>=19.0.0
+      - pybind11
+      - pylatexenc
+      - ray[default]>=2.10
+      - tensordict<=0.6.2
+      - torchdata
+      - torchvision
+      - transformers<=4.53.2
+      - wandb
+      - sglang[all]==0.4.6.post5
+      - torch-memory-saver>=0.0.5
+      - huggingface_hub
+      - cachetools
+      # == Search environment extra (README "1. Search") ==
+      - gym==0.26.2
+
+# ---------------------------------------------------------------------------
+# Steps from README.md that conda cannot capture here. Run these after
+# `conda env create -f environment.yaml`:
+#
+#   conda activate DrMAS
+#
+#   # flash-attn must build with --no-build-isolation, which conda can't pass:
+#   pip3 install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
+#
+#   # editable installs must run from the repo root / package dir:
+#   pip3 install -e .
+#   pip install -e ./agent_system/environments/env_package/search/third_party
+# ---------------------------------------------------------------------------
