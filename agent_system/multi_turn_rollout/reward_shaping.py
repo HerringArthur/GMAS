@@ -23,9 +23,10 @@ dominates stopping; and a Router decision costs nothing, so redundant
 ``verify`` calls are free even though they consume the round budget and add no
 evidence.
 
-Both terms are added here as trajectory-level scalars.  Every response row of
-a trajectory still receives one and the same reward, so the existing per-row
-broadcast and the Router/SubAgent credit groups are unchanged.
+Both terms are computed here as trajectory-level scalars.  The caller applies
+the shaped reward to the Router rows only and keeps the raw reward on role
+rows, so SubAgent credit remains a pure answer-quality comparison while the
+Router alone carries the termination signal.
 
 Nothing is applied unless a caller passes a nonzero cost, so scenes that never
 set ``return_reason`` (Math, sequential orchestras) keep their exact behaviour.
@@ -114,6 +115,16 @@ def shape_episode_rewards(
         - float(decision_cost) * decisions
         - float(truncation_penalty) * truncated
     )
+
+
+def shaped_reward_for_row(agent_id: Any, shaped_reward: float, raw_reward: float) -> float:
+    """Return the reward a response row should carry.
+
+    The termination shaping is a Router-only signal: Router rows receive the
+    shaped value, every role row keeps the raw reward so SubAgent credit stays
+    a pure answer-quality comparison.
+    """
+    return float(shaped_reward) if str(agent_id) == ROUTER_AGENT else float(raw_reward)
 
 
 def _read(node: Any, key: str, default: Any = None) -> Any:

@@ -144,6 +144,21 @@ class ShapingTests(unittest.TestCase):
         np.testing.assert_array_equal(rewards, [1.0])
 
 
+class RowRoutingTests(unittest.TestCase):
+    def test_router_row_gets_shaped_reward(self):
+        self.assertEqual(shaping.shaped_reward_for_row("Router Agent", 0.88, 1.0), 0.88)
+
+    def test_role_row_keeps_raw_reward(self):
+        for role in ("SOLVE", "VERIFY", "REVISE"):
+            self.assertEqual(shaping.shaped_reward_for_row(role, 0.88, 1.0), 1.0)
+
+    def test_agent_id_subclass_is_normalized(self):
+        self.assertEqual(shaping.shaped_reward_for_row(StrSubclass("Router Agent"), 0.88, 1.0), 0.88)
+
+    def test_empty_agent_id_is_not_router(self):
+        self.assertEqual(shaping.shaped_reward_for_row("", 0.88, 1.0), 1.0)
+
+
 class SettingsTests(unittest.TestCase):
     class Config(dict):
         """Stand in for the OmegaConf nodes; only ``get`` is used."""

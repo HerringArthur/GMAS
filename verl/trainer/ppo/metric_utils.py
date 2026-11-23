@@ -246,6 +246,27 @@ def compute_data_metrics(batch: DataProto, unique_wg_ids: List[str], group_n: in
         # **({f"episode/{k.replace('success_rate', 'pass@1')}": v[0].item() for k, v in batch.non_tensor_batch.items() if "success_rate" in k}), # replace success_rate to pass@1
     })
 
+    # Termination bookkeeping. ``episode_rewards`` is the shaped training
+    # reward, so the raw environment score is logged separately; the finish and
+    # truncation rates are what a termination-shaping change should move.
+    raw_episode_rewards = batch.non_tensor_batch.get("episode_rewards_raw")
+    if raw_episode_rewards is not None:
+        metrics.update({
+            "episode/reward_raw/mean": raw_episode_rewards[unique_idx].mean().item(),
+            "episode/reward_raw/min": raw_episode_rewards[unique_idx].min().item(),
+        })
+    return_reasons = batch.non_tensor_batch.get("return_reason")
+    if return_reasons is not None:
+        reasons_per_traj = {}
+        for traj, reason in zip(batch.non_tensor_batch["traj_uid"], return_reasons):
+            text = str(reason or "")
+            if text:
+                reasons_per_traj[traj] = text
+        if reasons_per_traj:
+            values = list(reasons_per_traj.values())
+            metrics["episode/finish_rate"] = sum(v == "finish" for v in values) / len(values)
+            metrics["episode/truncation_rate"] = sum(v != "finish" for v in values) / len(values)
+
     passk_avgk_metrics = compute_pass_at_k_and_avg_at_k(
         unique_uids=unique_uids,
         unique_task_pass=unique_task_pass,

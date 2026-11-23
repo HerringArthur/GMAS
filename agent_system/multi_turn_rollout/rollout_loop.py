@@ -27,6 +27,7 @@ from agent_system.multi_turn_rollout.reward_shaping import (
     read_shaping_settings,
     router_decision_counts,
     shape_episode_rewards,
+    shaped_reward_for_row,
     truncation_flags,
 )
 from agent_system.environments import EnvironmentManagerBase
@@ -128,9 +129,9 @@ class TrajectoryCollector:
         #     success_rate[key] = np.mean(value)
 
         # Termination shaping is applied once, here, after group filtering and
-        # success evaluation have consumed the unshaped rewards. Each response
-        # row still receives one scalar per trajectory, so credit groups are
-        # unaffected; the raw value is kept for logging.
+        # success evaluation have consumed the unshaped rewards. The shaped
+        # scalar is written to the Router rows only; role rows keep the raw EM
+        # so SubAgent credit stays a pure answer-quality comparison.
         decision_cost, truncation_penalty = read_shaping_settings(self.config)
         shaped_rewards = shape_episode_rewards(
             episode_rewards,
@@ -146,8 +147,12 @@ class TrajectoryCollector:
             for data in total_batch_list[bs]:
                 assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
                 if data['active_masks']:
-                    # episode_rewards
-                    data['episode_rewards'] = shaped_rewards[bs]
+                    # episode_rewards — shaping is a termination signal for the
+                    # Router only; role rows keep the raw EM so SubAgent credit
+                    # stays a pure answer-quality comparison.
+                    data['episode_rewards'] = shaped_reward_for_row(
+                        data.get("agent_id", ""), shaped_rewards[bs], float(episode_rewards[bs])
+                    )
                     data['episode_rewards_raw'] = float(episode_rewards[bs])
                     # episode_lengths
                     data['episode_lengths'] = episode_lengths[bs]
