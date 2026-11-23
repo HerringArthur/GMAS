@@ -23,6 +23,12 @@ from verl.utils.dataset.rl_dataset import collate_fn
 from transformers import PreTrainedTokenizer
 import uuid
 from agent_system.multi_turn_rollout.utils import to_list_of_dict, torch_to_numpy, filter_group_data, preprocess_batch
+from agent_system.multi_turn_rollout.reward_shaping import (
+    read_shaping_settings,
+    router_decision_counts,
+    shape_episode_rewards,
+    truncation_flags,
+)
 from agent_system.environments import EnvironmentManagerBase
 from agent_system.agent import BaseOrchestra
 from agent_system.agent.orchestra.router.router_orchestra import update_text_action
@@ -120,7 +126,20 @@ class TrajectoryCollector:
         # success_rate = {}
         # for key, value in success.items():
         #     success_rate[key] = np.mean(value)
-        
+
+        # Termination shaping is applied once, here, after group filtering and
+        # success evaluation have consumed the unshaped rewards. Each response
+        # row still receives one scalar per trajectory, so credit groups are
+        # unaffected; the raw value is kept for logging.
+        decision_cost, truncation_penalty = read_shaping_settings(self.config)
+        shaped_rewards = shape_episode_rewards(
+            episode_rewards,
+            router_decision_counts(total_batch_list),
+            truncation_flags(total_batch_list),
+            decision_cost=decision_cost,
+            truncation_penalty=truncation_penalty,
+        )
+
         effective_batch = []
         for bs in range(batch_size):
             # sum the rewards for each data in total_batch_list[bs]
@@ -128,7 +147,8 @@ class TrajectoryCollector:
                 assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
                 if data['active_masks']:
                     # episode_rewards
-                    data['episode_rewards'] = episode_rewards[bs]
+                    data['episode_rewards'] = shaped_rewards[bs]
+                    data['episode_rewards_raw'] = float(episode_rewards[bs])
                     # episode_lengths
                     data['episode_lengths'] = episode_lengths[bs]
                     # tool_callings

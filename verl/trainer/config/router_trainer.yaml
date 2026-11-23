@@ -17,6 +17,9 @@ agent:
 env:
   env_name: math
   history_length: 2 # Search environments supply tool history through env_obs.
+  reward_shaping:
+    decision_cost: 0.0 # Priced per Router decision; 0 disables termination shaping.
+    truncation_penalty: 0.0 # Applied once when a trajectory ends without an explicit finish().
 
 algorithm:
   adv_estimator: grpo

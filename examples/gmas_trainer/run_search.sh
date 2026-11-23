@@ -63,6 +63,12 @@ orchestra_type=router
 max_turn=4 # Environment interactions, including searches.
 max_loop_num=4 # Router/role collaboration rounds per environment step.
 
+# Termination shaping. Without it a submitted answer is worth the same as one
+# recovered by the round budget, and a redundant verify() costs nothing.
+# Set both to 0 for the unshaped ablation arm.
+reward_decision_cost=0.02 # Per Router decision; 16 decisions cost at most 0.32.
+reward_truncation_penalty=0.2 # Once per trajectory that never calls finish().
+
 # Per-agent overrides, ordered as Router, SEARCH, VERIFY, ANSWER.
 actor_optim_lr='[1e-6,1e-6,1e-6,1e-6]'
 actor_ppo_micro_batch_size_per_gpu='[4,4,4,4]'
@@ -126,6 +132,8 @@ run_with_trainer_log gmas "$MODE" python3 -m verl.trainer.main_ppo --config-name
     env.search.search_url="$search_url" \
     ++env.search.batch_size=64 \
     env.max_steps=$max_turn \
+    env.reward_shaping.decision_cost=$reward_decision_cost \
+    env.reward_shaping.truncation_penalty=$reward_truncation_penalty \
     env.rollout.n=$group_size \
     env.rollout.val_n=$val_group_size \
     env.history_length=$max_turn \
