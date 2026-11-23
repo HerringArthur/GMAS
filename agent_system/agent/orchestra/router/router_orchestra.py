@@ -199,6 +199,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
         actor_rollout_wgs,
         active_masks: np.ndarray,
         step: int,
+        round_index: int = 1,
     ) -> Tuple[List[str], List[Dict[str, Any]]]:
         self.reset_buffer()
         if self.team_context is None:
@@ -218,6 +219,7 @@ class RouterMultiAgentOrchestra(BaseOrchestra):
             actor_rollout_wg=actor_rollout_wg,
             agent_active_mask=pending_mask,
             step=step,
+            round_index=round_index,
         )
         selections = router_batch.non_tensor_batch["selected_role"]
         finish_mask = selections == self.FINISH

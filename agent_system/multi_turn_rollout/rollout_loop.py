@@ -552,13 +552,16 @@ class MultiAgentTrajectoryCollector(TrajectoryCollector):
             multiagent_batch_buffer = []
             text_actions = [""] * batch_size
             for _round in range(max_rounds):
-                text_actions, round_buffer = self.multiagent_orchestra.run(
+                run_kwargs = dict(
                     gen_batch=gen_batch,
                     env_obs=obs,
                     actor_rollout_wgs=actor_rollout_wg,
                     active_masks=active_masks,
-                    step=_step+1
+                    step=_step + 1,
                 )
+                if router_orchestra:
+                    run_kwargs["round_index"] = _round + 1
+                text_actions, round_buffer = self.multiagent_orchestra.run(**run_kwargs)
                 multiagent_batch_buffer.extend(round_buffer)
                 if not router_orchestra or np.all(self.multiagent_orchestra.return_reasons[active_masks] != ""):
                     break
