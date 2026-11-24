@@ -211,6 +211,9 @@ def compute_data_metrics(batch: DataProto, unique_wg_ids: List[str], group_n: in
     unique_traj_uid, unique_idx = np.unique(batch.non_tensor_batch['traj_uid'], return_index=True)
     unique_uids = uids[unique_idx]
     unique_task_pass = task_pass[unique_idx]
+    episode_rewards = batch.non_tensor_batch["episode_rewards"][unique_idx]
+    episode_lengths = batch.non_tensor_batch["episode_lengths"][unique_idx]
+    tool_callings = batch.non_tensor_batch["tool_callings"][unique_idx]
 
     # Add global metrics
     metrics.update({
@@ -225,25 +228,13 @@ def compute_data_metrics(batch: DataProto, unique_wg_ids: List[str], group_n: in
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
         # episode
-        "episode/reward/mean": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].mean().item(),
-        "episode/reward/max": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].max().item(),
-        "episode/reward/min": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].min().item(),
-        "episode/length/mean": 
-            batch.non_tensor_batch["episode_lengths"][unique_idx].mean().item(),
-        "episode/length/max":
-            batch.non_tensor_batch["episode_lengths"][unique_idx].max().item(),
-        "episode/length/min": 
-            batch.non_tensor_batch["episode_lengths"][unique_idx].min().item(),
-        "episode/tool_call_count/mean": 
-            batch.non_tensor_batch["tool_callings"][unique_idx].mean().item(),
-        # "episode/tool_call_count/max":
-        #     batch.non_tensor_batch["tool_callings"][unique_idx].max().item(),
-        # "episode/tool_call_count/min":
-        #     batch.non_tensor_batch["tool_callings"][unique_idx].min().item(),
-        # **({f"episode/{k.replace('success_rate', 'pass@1')}": v[0].item() for k, v in batch.non_tensor_batch.items() if "success_rate" in k}), # replace success_rate to pass@1
+        "episode/reward/mean": float(episode_rewards.mean()),
+        "episode/reward/max": float(episode_rewards.max()),
+        "episode/reward/min": float(episode_rewards.min()),
+        "episode/length/mean": float(episode_lengths.mean()),
+        "episode/length/max": int(episode_lengths.max()),
+        "episode/length/min": int(episode_lengths.min()),
+        "episode/tool_call_count/mean": float(tool_callings.mean()),
     })
 
     # Termination bookkeeping. ``episode_rewards`` is the shaped training
@@ -251,9 +242,10 @@ def compute_data_metrics(batch: DataProto, unique_wg_ids: List[str], group_n: in
     # truncation rates are what a termination-shaping change should move.
     raw_episode_rewards = batch.non_tensor_batch.get("episode_rewards_raw")
     if raw_episode_rewards is not None:
+        raw_episode_rewards = raw_episode_rewards[unique_idx]
         metrics.update({
-            "episode/reward_raw/mean": raw_episode_rewards[unique_idx].mean().item(),
-            "episode/reward_raw/min": raw_episode_rewards[unique_idx].min().item(),
+            "episode/reward_raw/mean": float(raw_episode_rewards.mean()),
+            "episode/reward_raw/min": float(raw_episode_rewards.min()),
         })
     return_reasons = batch.non_tensor_batch.get("return_reason")
     if return_reasons is not None:
