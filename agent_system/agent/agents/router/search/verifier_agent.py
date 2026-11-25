@@ -73,8 +73,10 @@ def parse_report(response: Optional[str]) -> Optional[VerificationReport]:
     if re.search(r"</?verify\b", assessment, re.IGNORECASE):
         return None
     # The team needs a visible review, even if the model also emits reasoning tags.
-    prose = re.sub(r"<(think|next)>.*?</\1>", "", assessment, flags=re.DOTALL)
-    if not prose.strip():
+    prose = re.sub(r"<(think|next)>.*?</\1>", "", assessment, flags=re.DOTALL | re.IGNORECASE)
+    if re.search(r"</?(?:think|next|answer|route|search)\b", prose, flags=re.IGNORECASE):
+        return None
+    if not any(char.isalnum() for char in prose):
         return None
     return VerificationReport(assessment, match.group(1))
 
