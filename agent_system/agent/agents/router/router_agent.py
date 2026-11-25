@@ -33,7 +33,7 @@ ROLE_DESCRIPTIONS = {
     },
     "search": {
         "SEARCH": "Write a search query. The environment executes it automatically before your next decision.",
-        "VERIFY": "Check whether the retrieved evidence is sufficient and supports the candidate answer.",
+        "VERIFY": "Review retrieved evidence for ANSWER. Read the correction if one is given. A no supplies a query for SEARCH.",
         "ANSWER": "Use the available evidence to write or correct an answer.",
     },
 }

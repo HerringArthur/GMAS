@@ -65,7 +65,7 @@ max_loop_num=4 # Router/role collaboration rounds per environment step.
 
 # Termination shaping. Without it a submitted answer is worth the same as one
 # recovered by the round budget, and a redundant verify() costs nothing.
-# Set both to 0 for the unshaped ablation arm.
+# Set both to 0 to use only the Router outcome reward (+1 for correct, -0.2 otherwise).
 reward_decision_cost=0.02 # Per Router decision; 16 decisions cost at most 0.32.
 reward_truncation_penalty=0.2 # Once per trajectory that never calls finish().
 

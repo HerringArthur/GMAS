@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 from transformers import PreTrainedTokenizer
@@ -36,28 +36,47 @@ Treat this candidate as unverified.
 {team_context}
 
 # Your Role
-You are VERIFY. Assess whether the retrieved evidence supports answering the
-original question. Use the Router assignment to focus your review.
-Point to supporting facts or documents actually present in the search history,
-or identify specific missing or conflicting evidence. Queries, candidate answers,
-and teammates' claims are not retrieved evidence. Do not invent sources or results.
-Without a candidate, judge whether the evidence is sufficient to form an answer.
-With a candidate, also check whether the evidence supports that answer.
+You are VERIFY. Review retrieved evidence for ANSWER and SEARCH. Identify exactly what the
+question asks for (person, work, place, date, etc.). Check each fact needed to
+connect that target to the answer. Cite a passage by its title or a short quote.
+Use only passages in the search history as sources.
+
+When the passages settle the question, tell ANSWER the supported fact and how
+it answers the question. If the saved candidate names the wrong thing, identify
+the mismatch and give the supported correction. A candidate is optional.
+When evidence is missing or conflicting, name the specific unresolved link and
+give SEARCH one query targeting it. Use entity names or clues from the passages
+to narrow the query. If no passage has been retrieved, base the query on the question.
 
 # Output Format
-Give a brief assessment, then end with exactly one verdict:
-<verify>yes</verify>: The evidence is sufficient and supports the candidate, if present.
-<verify>no</verify>: The evidence is missing, insufficient, conflicting, or contradicts the candidate.
-Use the verdict tag only once, at the end. Output nothing after </verify>.
+Write a brief review in plain text. Explain what the passages establish or
+what is missing. If more evidence is needed, include your suggested search
+query in that explanation. End with exactly one verdict:
+<verify>yes</verify> if ANSWER can write or correct the answer from the passages,
+or <verify>no</verify> if a necessary fact still requires retrieval.
 """
 
 
-def _has_final_verdict(response: str) -> bool:
-    """Require one terminal yes/no verdict, preserving the complete report."""
-    verdict = re.search(r"<verify>\s*(?:yes|no)\s*</verify>\s*\Z", response)
-    return verdict is not None and re.search(
-        r"</?verify\b", response[:verdict.start()], flags=re.IGNORECASE,
-    ) is None
+class VerificationReport(NamedTuple):
+    assessment: str
+    verdict: str
+
+
+def parse_report(response: Optional[str]) -> Optional[VerificationReport]:
+    """Check the handoff format before sharing the full text with the team."""
+    if not response:
+        return None
+    match = re.search(r"<verify>\s*(yes|no)\s*</verify>\s*\Z", response)
+    if not match:
+        return None
+    assessment = response[:match.start()].strip()
+    if re.search(r"</?verify\b", assessment, re.IGNORECASE):
+        return None
+    # The team needs a visible review, even if the model also emits reasoning tags.
+    prose = re.sub(r"<(think|next)>.*?</\1>", "", assessment, flags=re.DOTALL)
+    if not prose.strip():
+        return None
+    return VerificationReport(assessment, match.group(1))
 
 
 class VerifierAgent(BaseAgent):
@@ -94,7 +113,7 @@ class VerifierAgent(BaseAgent):
         batch, text_responses = self._generate_with_llm(batch, actor_rollout_wg, agent_active_mask, gen_batch.meta_info)
 
         batch.non_tensor_batch["is_action_valid"] = np.array(
-            [active and _has_final_verdict(response) for response, active in zip(text_responses, agent_active_mask)],
+            [active and parse_report(response) is not None for response, active in zip(text_responses, agent_active_mask)],
             dtype=bool,
         )
         batch.non_tensor_batch["selected_role"] = np.full(len(text_responses), "", dtype=object)

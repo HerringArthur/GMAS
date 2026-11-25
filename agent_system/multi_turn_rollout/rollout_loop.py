@@ -133,8 +133,12 @@ class TrajectoryCollector:
         # scalar is written to the Router rows only; role rows keep the raw EM
         # so SubAgent credit stays a pure answer-quality comparison.
         decision_cost, truncation_penalty = read_shaping_settings(self.config)
+        router_outcomes = episode_rewards
+        if self.config.env.env_name == "search":
+            # Search EM is binary. Empty submissions and incorrect answers both score zero.
+            router_outcomes = np.where(episode_rewards == 1, 1.0, -0.2)
         shaped_rewards = shape_episode_rewards(
-            episode_rewards,
+            router_outcomes,
             router_decision_counts(total_batch_list),
             truncation_flags(total_batch_list),
             decision_cost=decision_cost,

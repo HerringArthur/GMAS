@@ -24,6 +24,13 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class Tensor(np.ndarray):
+    def to(self, device):
+        assert device == 'cpu'
+        return self
+
+    def index_select(self, dim, indices):
+        return self.take(indices, axis=dim)
+
     def size(self, dim):
         return self.shape[dim]
 
@@ -125,6 +132,7 @@ def load_driver():
         'np': np, 'DataProto': Batch, 'deepcopy': deepcopy, 'Enum': Enum,
         '_timer': timer, 'pprint': lambda *args: None, 'defaultdict': defaultdict,
         'torch': SimpleNamespace(
+            as_tensor=lambda value, device=None: tensor(value),
             sum=lambda value, dim: value.sum(dim), zeros_like=np.zeros_like,
             tensor=lambda value, **kw: tensor(np.atleast_1d(value).astype(kw.get('dtype', float))),
             float32=np.float32, no_grad=nullcontext,
@@ -146,6 +154,8 @@ def load_driver():
             'apply_kl_penalty', 'compute_advantage',
         },
         'verl/trainer/ppo/core_algos.py': {'compute_grpo_outcome_advantage'},
+        'verl/trainer/ppo/metric_utils.py': {'compute_rollout_termination_metrics'},
+        'agent_system/agent/utils.py': {'normalize_agent_id'},
     }
     nodes = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)]
     for path, names in specs.items():
@@ -268,6 +278,7 @@ class ValidActionTrainingTests(unittest.TestCase):
             ref=Config(log_prob_micro_batch_size_per_gpu=2),
         )
         config = Config(
+            agent=Config(orchestra_type='search'),
             trainer=Config(project_name='test', experiment_name='filter', logger=[], total_epochs=1,
                            val_before_train=False, balance_batch=balance, n_gpus_per_node=1, nnodes=1,
                            critic_warmup=0, test_freq=1, save_freq=1, rollout_data_dir='fake-dump',
@@ -299,7 +310,7 @@ class ValidActionTrainingTests(unittest.TestCase):
             compute_reward=lambda batch, fn: scores(batch),
             compute_reward_async=SimpleNamespace(remote=lambda batch, *args: scores(batch)),
             ray=SimpleNamespace(get=lambda result: result), apply_invalid_action_penalty=penalty,
-            compute_advantage=advantage, agg_loss=lambda **kw: tensor(1.0), reduce_metrics=lambda x: x,
+            compute_advantage=advantage, agg_loss=lambda *args, **kw: tensor(1.0), reduce_metrics=lambda x: x,
             compute_data_metrics=lambda **kw: {},
             compute_timing_metrics=lambda **kw: {
                 f'timing_s/{name}': value for name, value in kw['timing_raw'].items()
@@ -364,6 +375,17 @@ class ValidActionTrainingTests(unittest.TestCase):
                     np.asarray(dumped['outputs']) - 0.1 * (~trained.non_tensor_batch['is_action_valid']),
                 )
                 self.assertEqual(dumped['outputs'], dumped['reward_extra_infos_dict']['reward_row'])
+
+    def test_termination_rates_follow_rollout_order_before_worker_grouping(self):
+        source = rollout(['worker', 'router', 'router', 'worker', 'router', 'router', 'worker'])
+        source.non_tensor_batch.update(
+            traj_uid=np.array(['a', 'a', 'b', 'b', 'c', 'c', 'unlabeled']),
+            return_reason=np.array(['search', 'finish', 'finish', 'loop_limit', 'finish', '', '']),
+        )
+        self.run_fit([source])
+        metrics = self.logs[0][1]
+        self.assertEqual(metrics['episode/finish_rate'], 2 / 3)
+        self.assertEqual(metrics['episode/truncation_rate'], 1 / 3)
 
     def test_all_invalid_and_following_valid_batch_both_train(self):
         source = rollout(['router', 'worker'], [False, False])

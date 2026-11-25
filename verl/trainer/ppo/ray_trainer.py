@@ -49,6 +49,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_rollout_termination_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -1267,6 +1268,8 @@ class RayPPOTrainer:
                     # batch = batch.union(gen_batch_output)
                     del batch
                     batch = gen_batch_output
+                    # Worker grouping and padding below destroy chronological call order.
+                    metrics.update(compute_rollout_termination_metrics(batch))
                     # Preserve real call identity through padding and reordering.
                     batch.non_tensor_batch["rollout_row_id"] = np.arange(len(batch), dtype=np.int64)
                     rollout_valid_action_mask = get_valid_action_mask(batch)

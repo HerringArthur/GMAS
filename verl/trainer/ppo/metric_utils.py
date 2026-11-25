@@ -110,6 +110,27 @@ def compute_role_data_metrics(batch: DataProto) -> Dict[str, Any]:
     return metrics
 
 
+def compute_rollout_termination_metrics(rollout: DataProto) -> Dict[str, float]:
+    """Use each trajectory's last nonempty reason in the collector's call order."""
+    reasons = rollout.non_tensor_batch.get("return_reason")
+    if reasons is None:
+        return {}
+
+    last_reason = {}
+    for traj, reason in zip(rollout.non_tensor_batch["traj_uid"], reasons):
+        if reason:
+            last_reason[traj] = reason
+
+    count = len(last_reason)
+    if not count:
+        return {}
+    finished = sum(reason == "finish" for reason in last_reason.values())
+    return {
+        "episode/finish_rate": finished / count,
+        "episode/truncation_rate": (count - finished) / count,
+    }
+
+
 def compute_data_metrics(batch: DataProto, unique_wg_ids: List[str], group_n: int, use_critic: bool = True) -> Dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -237,9 +258,7 @@ def compute_data_metrics(batch: DataProto, unique_wg_ids: List[str], group_n: in
         "episode/tool_call_count/mean": float(tool_callings.mean()),
     })
 
-    # Termination bookkeeping. ``episode_rewards`` is the shaped training
-    # reward, so the raw environment score is logged separately; the finish and
-    # truncation rates are what a termination-shaping change should move.
+    # Log the raw environment score separately from the shaped training reward.
     raw_episode_rewards = batch.non_tensor_batch.get("episode_rewards_raw")
     if raw_episode_rewards is not None:
         raw_episode_rewards = raw_episode_rewards[unique_idx]
@@ -247,17 +266,6 @@ def compute_data_metrics(batch: DataProto, unique_wg_ids: List[str], group_n: in
             "episode/reward_raw/mean": float(raw_episode_rewards.mean()),
             "episode/reward_raw/min": float(raw_episode_rewards.min()),
         })
-    return_reasons = batch.non_tensor_batch.get("return_reason")
-    if return_reasons is not None:
-        reasons_per_traj = {}
-        for traj, reason in zip(batch.non_tensor_batch["traj_uid"], return_reasons):
-            text = str(reason or "")
-            if text:
-                reasons_per_traj[traj] = text
-        if reasons_per_traj:
-            values = list(reasons_per_traj.values())
-            metrics["episode/finish_rate"] = sum(v == "finish" for v in values) / len(values)
-            metrics["episode/truncation_rate"] = sum(v != "finish" for v in values) / len(values)
 
     passk_avgk_metrics = compute_pass_at_k_and_avg_at_k(
         unique_uids=unique_uids,
